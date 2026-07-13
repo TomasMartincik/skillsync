@@ -43,6 +43,7 @@ import {
   STAGE_PREFIX,
   TXN_FILE,
 } from './constants.js';
+import { fsyncDir, fsyncHandle, fsyncParent } from './durable.js';
 import { writeExclude } from './exclude.js';
 import { hashFiles } from './hash.js';
 import { getSecret, journalMac, verifyJournalMac } from './secret.js';
@@ -55,12 +56,6 @@ const JOURNAL_SCHEMA = 3;
 const AGENTS_DIR = '.agents';
 
 const HASH_RE = /^sha256:[0-9a-f]{64}$/;
-
-/**
- * Directory-fsync error codes that are tolerated because the platform/filesystem
- * does not support fsync on a directory descriptor. Everything else is fatal.
- */
-const DIR_FSYNC_IGNORE = new Set(['EINVAL', 'ENOTSUP']);
 
 /**
  * @typedef {Object} TargetWrite
@@ -121,13 +116,20 @@ export async function stageTargets(projectDir, targetSpecs, onPhase) {
   const stageDir = path.join(projectDir, stageRel);
 
   if (onPhase) await onPhase('stage');
-  await fs.mkdir(stageDir, { recursive: true });
+  await fs.mkdir(path.join(projectDir, AGENTS_DIR), { recursive: true });
+  // Staging is PRIVATE (0700): it narrows the window in which another *user* on
+  // the machine could tamper with bytes we have already hashed. (Against the same
+  // user, the last-moment re-hash in applyJournal is the real defense.)
+  await fs.mkdir(stageDir, { recursive: true, mode: 0o700 });
 
   /** @type {StagedTarget[]} */
   const targets = [];
   for (let i = 0; i < targetSpecs.length; i++) {
     const spec = targetSpecs[i];
     const stagedName = `t${i}`;
+    // The staged dir itself keeps normal permissions — it BECOMES the materialized
+    // skill dir after the rename; the 0700 staging ROOT above is what denies other
+    // users traversal while it is staged.
     const stagedAbs = path.join(stageDir, stagedName);
     await fs.mkdir(stagedAbs, { recursive: true });
     /** @type {Set<string>} */
@@ -280,12 +282,29 @@ async function applyJournal(projectDir, journal, onPhase) {
       // the check/use window against a symlinked ancestor swapped in post-journal.
       await ensureDirNoSymlink(projectDir, path.dirname(s.targetRel));
       if ((await exists(targetAbs)) && !(await exists(backupAbs))) {
-        await ensureDirNoSymlink(projectDir, path.dirname(s.backupRel));
+        await revalidateRename(projectDir, s.targetRel, s.backupRel);
         await fs.rename(targetAbs, backupAbs);
         await fsyncParent(targetAbs);
         await fsyncParent(backupAbs);
       }
       if (onPhase) await onPhase(`swap.${i}.post-backup`);
+      // LAST-MOMENT revalidation (round-3 review MAJOR: validation was not coupled
+      // to the rename). Between the checks above and this rename — in particular
+      // across the `post-backup` callback — another same-user process could have
+      // (a) swapped a live ancestor for a symlink pointing outside the project, or
+      // (b) modified the staged bytes we already hashed. Re-check both immediately
+      // before we install: parents non-symlinked, staged tree still hashing to the
+      // journaled authority.
+      await revalidateRename(projectDir, s.stagedRel, s.targetRel);
+      const final = await hashMaterialized(stagedAbs).catch((err) => {
+        throw ambiguity(journal, `staged tree ${s.stagedRel} could not be re-validated before install: ${errMsg(err)}`);
+      });
+      if (final !== s.stagedHash) {
+        throw ambiguity(
+          journal,
+          `staged tree ${s.stagedRel} changed after journaling (hash ${final} != journaled ${s.stagedHash}); refusing to install it`,
+        );
+      }
       await fs.rename(stagedAbs, targetAbs);
       await fsyncParent(targetAbs);
       await fsyncParent(stagedAbs);
@@ -313,7 +332,10 @@ async function applyJournal(projectDir, journal, onPhase) {
     const targetAbs = abs(r.targetRel);
     const backupAbs = abs(r.backupRel);
     if ((await exists(targetAbs)) && !(await exists(backupAbs))) {
-      await ensureDirNoSymlink(projectDir, path.dirname(r.backupRel));
+      // Same last-moment revalidation as the swaps: a `.claude` replaced by a
+      // symlink after journal validation must not let a removal move an OUTSIDE
+      // directory into the project backup.
+      await revalidateRename(projectDir, r.targetRel, r.backupRel);
       await fs.rename(targetAbs, backupAbs);
       await fsyncParent(targetAbs);
       await fsyncParent(backupAbs);
@@ -626,6 +648,12 @@ async function assertNoSymlinkAncestors(projectDir, rel) {
  * Create `relDir` beneath the project, verifying with a non-following lstat that
  * no existing component is a symlink. Used right before a rename so a symlinked
  * ancestor introduced after journal validation cannot redirect the write.
+ *
+ * Every directory we CREATE here is a live ancestor of a materialized skill
+ * (`.claude`, `.claude/skills`, `.agents`, …), so its parent is fsynced right
+ * after the mkdir (round-3 review MAJOR: the manifest could be made durable while
+ * the unsynced `.claude` directory entry was lost to a power failure, leaving a
+ * manifest that claims skills the filesystem no longer has).
  * @param {string} projectDir
  * @param {string} relDir POSIX project-relative directory
  */
@@ -642,6 +670,7 @@ async function ensureDirNoSymlink(projectDir, relDir) {
     } catch (err) {
       if (err && err.code === 'ENOENT') {
         await fs.mkdir(cur);
+        await fsyncParent(cur); // the new directory entry must survive a crash
         continue;
       }
       throw err;
@@ -656,6 +685,29 @@ async function ensureDirNoSymlink(projectDir, relDir) {
       throw new SkillsyncError('UNSAFE_ANCESTOR', `path component is not a directory: ${path.relative(projectDir, cur)}`);
     }
   }
+}
+
+/**
+ * Re-verify a rename's SOURCE and DESTINATION immediately before `fs.rename` is
+ * issued (round-3 review MAJOR: journal-time validation was decoupled from the
+ * rename, so a `.claude` replaced by a symlink after validation was still
+ * followed). Checks that no component of the source path — including the source
+ * itself, which `rename` would otherwise move as a link — is a symlink, and that
+ * the destination's parent chain is real directories and the destination is not a
+ * symlink.
+ *
+ * This CLOSES the window; it cannot ELIMINATE it: a no-follow, fd-relative rename
+ * (`openat`/`renameat2`) is not expressible in zero-dependency Node, so a race
+ * that lands between this check and the syscall remains theoretically possible.
+ * See the README's "Residual TOCTOU limit" — it assumes a non-hostile local user.
+ * @param {string} projectDir
+ * @param {string} srcRel
+ * @param {string} dstRel
+ */
+async function revalidateRename(projectDir, srcRel, dstRel) {
+  await assertNoSymlinkAncestors(projectDir, srcRel);
+  await ensureDirNoSymlink(projectDir, path.dirname(dstRel));
+  await assertNoSymlinkAncestors(projectDir, dstRel);
 }
 
 /**
@@ -779,42 +831,10 @@ async function copyFile(srcAbs, destAbs, exec) {
   // manifest over a partially-written staged tree.
   const dfh = await fs.open(destAbs, 'r');
   try {
-    await dfh.sync();
+    await fsyncHandle(dfh, destAbs);
   } finally {
     await dfh.close();
   }
-}
-
-/**
- * fsync a directory so a preceding rename/create is durable. Only platform
- * "unsupported" codes (EINVAL/ENOTSUP) are tolerated; every other error is fatal.
- * A missing directory is tolerated (nothing to make durable).
- * @param {string} dir
- */
-async function fsyncDir(dir) {
-  let fh;
-  try {
-    fh = await fs.open(dir, 'r');
-  } catch (err) {
-    if (err && err.code === 'ENOENT') return;
-    throw err;
-  }
-  try {
-    await fh.sync();
-  } catch (err) {
-    if (!(err && DIR_FSYNC_IGNORE.has(err.code))) throw err;
-  } finally {
-    await fh.close();
-  }
-}
-
-/**
- * fsync the immediate parent directory of a path (durability for a rename/create
- * whose directory entry must survive a crash).
- * @param {string} p
- */
-function fsyncParent(p) {
-  return fsyncDir(path.dirname(p));
 }
 
 /**
@@ -828,7 +848,7 @@ async function atomicWrite(filePath, content) {
   const fh = await fs.open(tmp, 'w');
   try {
     await fh.writeFile(content, 'utf8');
-    await fh.sync();
+    await fsyncHandle(fh, tmp);
   } finally {
     await fh.close();
   }
