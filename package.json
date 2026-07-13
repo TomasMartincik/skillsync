@@ -1,0 +1,17 @@
+{
+  "name": "skillsync",
+  "version": "0.1.0",
+  "description": "Distribute Agent Skills from one central git repo into many projects for Claude Code + Codex. Zero dependencies, no build step.",
+  "type": "module",
+  "bin": {
+    "skillsync": "bin/skillsync.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "license": "MIT",
+  "private": false
+}
