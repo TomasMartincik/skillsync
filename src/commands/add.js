@@ -33,6 +33,7 @@ export async function add(argv, ctx) {
   const { positionals, flags } = parseArgs(argv, { valueFlags: ['agents'] });
   if (positionals.length === 0) throw new SkillsyncError('USAGE', 'usage: skillsync add <skill>…');
   for (const skill of positionals) assertSkillName(skill, 'skill argument');
+  assertNoDuplicates(positionals, 'skill');
 
   const agentsFilter = parseAgentsFilter(flags.agents);
   const project = resolveProject(ctx.cwd);
@@ -109,5 +110,23 @@ function parseAgentsFilter(raw) {
       throw new SkillsyncError('BAD_AGENTS', `unknown agent "${a}"; known: ${AGENTS.join(', ')}`);
     }
   }
+  // Reject duplicates: `--agents claude,claude` would otherwise serialize a
+  // manifest the tool refuses to read (adversarial-review MAJOR).
+  assertNoDuplicates(list, 'agent');
   return list.length > 0 ? list : undefined;
+}
+
+/**
+ * Throw on any duplicate value in `items` (order preserved for the message).
+ * @param {string[]} items
+ * @param {string} label
+ */
+function assertNoDuplicates(items, label) {
+  const seen = new Set();
+  for (const item of items) {
+    if (seen.has(item)) {
+      throw new SkillsyncError('DUPLICATE_INPUT', `duplicate ${label} argument: ${JSON.stringify(item)}`);
+    }
+    seen.add(item);
+  }
 }

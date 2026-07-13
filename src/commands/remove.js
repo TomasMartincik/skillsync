@@ -21,6 +21,11 @@ export async function remove(argv, ctx) {
   const { positionals } = parseArgs(argv);
   if (positionals.length === 0) throw new SkillsyncError('USAGE', 'usage: skillsync remove <skill>…');
   for (const skill of positionals) assertSkillName(skill, 'skill argument');
+  const seen = new Set();
+  for (const skill of positionals) {
+    if (seen.has(skill)) throw new SkillsyncError('DUPLICATE_INPUT', `duplicate skill argument: ${JSON.stringify(skill)}`);
+    seen.add(skill);
+  }
 
   const project = resolveProject(ctx.cwd);
 
