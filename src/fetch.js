@@ -45,8 +45,15 @@ export async function mkTmp() {
 export function cloneOperand(source) {
   const s = String(source);
   if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(s)) return s; // scheme://…
-  if (/^[^/\s]+@[^/\s]+:/.test(s)) return s; // scp-like user@host:path
   if (s.startsWith('file://')) return s;
+  // Git scp-like shorthand: `[user@]host:path`. Git treats a source as scp syntax
+  // when a colon appears BEFORE the first slash (so `host:path` without a username
+  // is valid too — MINOR regression). A colon after a slash (e.g. `./a:b`) or no
+  // colon is a local path, resolved to absolute so a leading `-` is never an
+  // option.
+  const colon = s.indexOf(':');
+  const slash = s.indexOf('/');
+  if (colon > 0 && (slash === -1 || colon < slash)) return s;
   return path.resolve(s); // local path -> absolute
 }
 
@@ -161,38 +168,55 @@ export async function fullClone(source) {
 
 /**
  * @typedef {Object} Publication
- * @property {string} skillRel POSIX rel path to the skill dir in the checkout
- * @property {{ commit: string, version: string, tree: string }[]} observed
- *   first-parent history newest -> oldest, one entry per commit where the skill
- *   exists; `tree` is the git tree object id of the skill dir (content identity).
+ * @property {string} skillRel POSIX rel path to the skill dir at HEAD (or the
+ *   newest boundary where it existed)
+ * @property {{ commit: string, version: string, tree: string, rel: string }[]} observed
+ *   first-parent tree-change boundaries newest -> oldest, one entry per boundary
+ *   where the skill exists; `tree` is the git tree object id of the skill dir
+ *   (content identity); `rel` is the skill dir path AT that boundary.
  */
 
 /**
  * Scan a skill's first-parent publication history and enforce the central-repo
- * invariants (adversarial-review MAJOR: duplicate versions / no `add` validation):
+ * invariants (adversarial-review MAJOR: duplicate versions / no `add` validation;
+ * history broke when a skill directory moved):
  *   - versions are monotonically non-decreasing over time (no regression);
  *   - each version maps to exactly ONE canonical skill tree — a version reused
- *     across a real content change (the skill tree object id differs) is rejected
- *     as a duplicate, because an old project pinning content A and a new project
- *     pinning content B under the same version cannot both resolve correctly.
+ *     across a real content change (the skill tree object id differs) is rejected.
+ *
+ * The skill directory is located PER BOUNDARY, not once at HEAD, so a rename such
+ * as `old/foo` -> `new/foo` keeps every historical release visible. We enumerate
+ * the first-parent commits that actually changed the skill's SKILL.md at any depth
+ * (few boundaries) rather than probing every first-parent commit.
  * @param {string} dir a full clone
  * @param {string} skill skill name
  * @returns {Promise<Publication>}
  */
 export async function scanPublication(dir, skill) {
   assertSkillName(skill);
-  const skillRel = await findSkillRel(dir, skill);
-  const revs = (await gitOrThrow(['rev-list', '--first-parent', 'HEAD'], { cwd: dir }))
+  // First-parent boundaries where this skill's SKILL.md changed, at ANY depth.
+  const boundaries = (
+    await gitOrThrow(
+      ['log', '--first-parent', '--format=%H', '--', `:(glob)**/${skill}/SKILL.md`],
+      { cwd: dir },
+    )
+  )
     .split('\n')
     .filter(Boolean);
 
   /** @type {Publication['observed']} */
   const observed = [];
-  for (const commit of revs) {
-    const v = await readSkillVersionAt(dir, commit, skillRel);
+  for (const commit of boundaries) {
+    const rel = await findSkillRelAt(dir, skill, commit); // path AT this boundary
+    if (rel === null) continue; // a deletion boundary
+    const v = await readSkillVersionAt(dir, commit, rel);
     if (v === null) continue;
-    const tree = await treeShaAt(dir, commit, skillRel);
-    observed.push({ commit, version: v, tree });
+    const tree = await treeShaAt(dir, commit, rel);
+    observed.push({ commit, version: v, tree, rel });
+  }
+
+  if (observed.length === 0) {
+    throw new SkillsyncError('SKILL_NOT_FOUND', `skill "${skill}" has no versioned history in source`);
   }
 
   // Monotonicity: newest -> oldest, versions must be non-increasing.
@@ -219,7 +243,36 @@ export async function scanPublication(dir, skill) {
     if (prev === undefined) versionTree.set(o.version, o.tree);
   }
 
-  return { skillRel, observed };
+  return { skillRel: observed[0].rel, observed };
+}
+
+/**
+ * Locate the uniquely-named skill directory (the one containing SKILL.md) within a
+ * single commit's tree. Returns null if the skill is absent at that commit; throws
+ * AMBIGUOUS_SKILL if two directories of that name both carry a SKILL.md.
+ * @param {string} dir
+ * @param {string} skill
+ * @param {string} commit
+ * @returns {Promise<string|null>} POSIX rel path of the skill dir at `commit`
+ */
+async function findSkillRelAt(dir, skill, commit) {
+  const out = await gitOrThrow(['ls-tree', '-r', '--name-only', commit], { cwd: dir });
+  const suffix = `/${skill}/SKILL.md`;
+  const exact = `${skill}/SKILL.md`;
+  /** @type {Set<string>} */
+  const dirs = new Set();
+  for (const line of out.split('\n')) {
+    if (line === exact) dirs.add(skill);
+    else if (line.endsWith(suffix)) dirs.add(line.slice(0, -'/SKILL.md'.length));
+  }
+  if (dirs.size === 0) return null;
+  if (dirs.size > 1) {
+    throw new SkillsyncError(
+      'AMBIGUOUS_SKILL',
+      `skill "${skill}" appears at multiple paths in ${commit.slice(0, 8)} (${[...dirs].join(', ')}); central must keep one canonical location`,
+    );
+  }
+  return [...dirs][0];
 }
 
 /**
@@ -346,29 +399,40 @@ export async function readSkillVersion(skillDir) {
 }
 
 /**
- * Normalize a frontmatter version value to a `major.minor` string, or null.
+ * Normalize a frontmatter version value to a CANONICAL `major.minor` string, or
+ * null. Leading zeros are stripped via BigInt so `01.02` and `1.2` canonicalize to
+ * the same value (adversarial-review: leading-zero versions formed distinct
+ * uniqueness keys while comparing numerically equal). Arbitrary-width integers are
+ * supported (no float truncation of e.g. `1.10`).
  * @param {unknown} v
  * @returns {string|null}
  */
 export function normalizeVersion(v) {
   if (v === null || v === undefined) return null;
   const s = String(v).trim();
-  if (/^\d+\.\d+$/.test(s)) return s;
-  if (/^\d+$/.test(s)) return `${s}.0`;
+  if (/^\d+\.\d+$/.test(s)) {
+    const [a, b] = s.split('.');
+    return `${BigInt(a)}.${BigInt(b)}`;
+  }
+  if (/^\d+$/.test(s)) return `${BigInt(s)}.0`;
   return null;
 }
 
 /**
- * Compare two `major.minor` versions. Returns <0, 0, >0.
+ * Compare two `major.minor` versions numerically with BigInt (leading zeros and
+ * arbitrarily large components compare correctly). Returns -1, 0, or 1.
  * @param {string} a
  * @param {string} b
  * @returns {number}
  */
 export function compareVersions(a, b) {
-  const [am, an] = a.split('.').map((x) => Number.parseInt(x, 10));
-  const [bm, bn] = b.split('.').map((x) => Number.parseInt(x, 10));
-  if (am !== bm) return am - bm;
-  return an - bn;
+  const [am, an] = a.split('.');
+  const [bm, bn] = b.split('.');
+  const major = BigInt(am) - BigInt(bm);
+  if (major !== 0n) return major < 0n ? -1 : 1;
+  const minor = BigInt(an) - BigInt(bn);
+  if (minor !== 0n) return minor < 0n ? -1 : 1;
+  return 0;
 }
 
 /**
