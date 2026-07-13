@@ -37,19 +37,74 @@ const IDENTITY_KEYS = new Set(['name', 'version']);
  */
 
 /**
- * Parse a double-quoted scalar starting at index 0 of `s` (s[0] === '"').
+ * The YAML 1.2 double-quoted escape table (single-character escapes). Anything not
+ * in here — and not one of the `\x`/`\u`/`\U` hex forms — is INVALID YAML and is
+ * rejected (round-3 review MAJOR: unknown escapes were silently dropped, so the
+ * malformed `name: "f\oo"` was normalized into the valid identity `foo`).
+ * @type {Record<string, string>}
+ */
+const DQ_ESCAPES = {
+  '0': '\0',
+  a: '\x07',
+  b: '\b',
+  t: '\t',
+  '\t': '\t',
+  n: '\n',
+  v: '\v',
+  f: '\f',
+  r: '\r',
+  e: '\x1b',
+  ' ': ' ',
+  '"': '"',
+  '/': '/',
+  '\\': '\\',
+  N: '\x85',
+  _: '\xa0',
+  L: '\u2028',
+  P: '\u2029',
+};
+
+/** `\xNN`, `\uNNNN`, `\UNNNNNNNN` — hex escape widths. */
+const DQ_HEX_WIDTH = { x: 2, u: 4, U: 8 };
+
+/**
+ * Parse a double-quoted scalar starting at index 0 of `s` (s[0] === '"'). Escapes
+ * are decoded per the YAML spec; an unknown or incomplete escape FAILS CLOSED
+ * rather than being silently normalized away.
  * @param {string} s
  * @returns {{ value: string, endIdx: number }} endIdx = index of the closing quote
  */
 function parseDoubleQuoted(s) {
-  const escapes = { n: '\n', t: '\t', r: '\r', '"': '"', '\\': '\\', '/': '/', '0': '\0', ' ': ' ' };
   let out = '';
   for (let i = 1; i < s.length; i++) {
     const ch = s[i];
     if (ch === '\\') {
       const next = s[i + 1];
       if (next === undefined) break; // trailing backslash => unterminated
-      out += Object.prototype.hasOwnProperty.call(escapes, next) ? escapes[next] : next;
+      const width = Object.prototype.hasOwnProperty.call(DQ_HEX_WIDTH, next) ? DQ_HEX_WIDTH[next] : 0;
+      if (width > 0) {
+        const hex = s.slice(i + 2, i + 2 + width);
+        if (hex.length !== width || !/^[0-9a-fA-F]+$/.test(hex)) {
+          throw new SkillsyncError(
+            'BAD_FRONTMATTER',
+            `invalid \\${next} escape in double-quoted string (expected ${width} hex digits): ${s}`,
+          );
+        }
+        const code = Number.parseInt(hex, 16);
+        if (code > 0x10ffff) {
+          throw new SkillsyncError('BAD_FRONTMATTER', `\\${next} escape is out of Unicode range: ${s}`);
+        }
+        out += String.fromCodePoint(code);
+        i += 1 + width;
+        continue;
+      }
+      if (!Object.prototype.hasOwnProperty.call(DQ_ESCAPES, next)) {
+        throw new SkillsyncError(
+          'BAD_FRONTMATTER',
+          `invalid escape "\\${next}" in double-quoted string: ${s}`,
+        );
+      }
+      out += DQ_ESCAPES[next];
       i++;
       continue;
     }
@@ -215,6 +270,28 @@ function consumeNested(lines, start) {
 }
 
 /**
+ * Split a top-level `key: rest` line, accepting a bare key OR a QUOTED key
+ * (round-3 review MAJOR: quoted keys were ignored, so `"name": evil` was invisible
+ * to the reader and could hide a semantic duplicate of a plain `name:`). Returns
+ * null for a line that is not a top-level key.
+ * @param {string} line
+ * @returns {{ key: string, rest: string }|null}
+ */
+function splitKeyLine(line) {
+  const first = line[0];
+  if (first === '"' || first === "'") {
+    // Throws on an unterminated quote / invalid escape — a malformed key is not
+    // "some other YAML construct" to be leniently ignored.
+    const { value, endIdx } = first === '"' ? parseDoubleQuoted(line) : parseSingleQuoted(line);
+    const after = line.slice(endIdx + 1);
+    if (!after.startsWith(':')) return null;
+    return { key: value, rest: after.slice(1) };
+  }
+  const m = line.match(/^([A-Za-z0-9_-]+):(.*)$/);
+  return m ? { key: m[1], rest: m[2] } : null;
+}
+
+/**
  * Parse frontmatter from a raw SKILL.md string.
  * @param {string} raw
  * @returns {Frontmatter}
@@ -235,11 +312,11 @@ export function parseFrontmatter(raw) {
     // not consume (e.g. an orphan nested child) — ignore leniently.
     if (indentOf(line) > 0) continue;
 
-    const m = line.match(/^([A-Za-z0-9_-]+):(.*)$/);
-    if (!m) continue; // not a top-level key:value — ignore leniently
+    const kv = splitKeyLine(line);
+    if (!kv) continue; // not a top-level key:value — ignore leniently
     sawKey = true;
-    const key = m[1];
-    const rest = m[2].replace(/^[ \t]/, ''); // drop the single space after the colon
+    const key = kv.key;
+    const rest = kv.rest.replace(/^[ \t]/, ''); // drop the single space after the colon
     const trimmed = rest.trim();
 
     if (Object.prototype.hasOwnProperty.call(data, key)) {
