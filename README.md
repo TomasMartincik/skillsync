@@ -109,9 +109,11 @@ credentials; there is no persistent per-machine clone.
 - `add` full-clones central, records the HEAD commit and the skill's frontmatter version, and
   **validates the skill's publication history** (versions must be unique and monotonic — a version
   reused across a real skill-tree change, or a regression, is rejected). History is walked by
-  enumerating the **first-parent boundaries** that changed the skill's `SKILL.md` and locating the
-  skill directory **at each boundary**, so a skill that moved (e.g. `old/foo` → `new/foo`) keeps
-  every historical release resolvable.
+  enumerating the **first-parent boundaries that changed anything in the skill's directory** — not
+  just its `SKILL.md`, so a commit touching only `scripts/helper.js` under an unchanged version is
+  caught as a duplicate version — and locating the skill directory **at each boundary**, so a skill
+  that moved (e.g. `old/foo` → `new/foo`) keeps every historical release resolvable. The scan is
+  batched (one `git log`, one `git cat-file --batch-check`) because it runs under the project lock.
 - `sync` reproduces the recorded **version**. The recorded `commit` is only a resolution cache and
   is **not authoritative**: it is accepted only if the skill at that commit declares the pinned
   version **and** its tree matches the recorded `sourceHash`. Retrieval escalates:
@@ -132,8 +134,17 @@ is validated with non-following `lstat`s — a symlinked `.agents/` is refused, 
 the project. The lock is a directory published atomically by `rename` (with a random ownership
 token); acquisition **waits** for a concurrent holder and reclaims a lock only when its recorded
 holder is provably gone on this host — the pid no longer exists, or the pid exists but its process
-**start time** differs from the recorded one (so a reused pid does not strand the lock). When
+**start time** differs from the recorded one (so a reused pid does not strand the lock). Start
+identity is compared **before** any pid short-circuit, including when the recorded pid is the
+*current* process's own pid: a lock is treated as live only when pid **and** start identity match,
+so a crashed holder's lock whose pid this process happens to inherit is still reclaimable. When
 liveness cannot be verified and the lock is old, the timeout error explains manual recovery.
+
+> **Stale-lock reclaim needs a process-start probe.** On Linux it reads `/proc/<pid>/stat`; on
+> macOS it shells out to **`ps -o lstart= -p <pid>`**. If `ps` cannot be executed (a restricted
+> sandbox), start identity is unknown and skillsync **refuses to steal** the lock — safe, but a
+> stale lock must then be removed by hand (`rm -rf .agents/.skillsync.lock`), as the timeout error
+> instructs.
 
 1. **stage** — generate each target's artifact into a private staging area under `.agents/`, then
    **scan, validate, and hash the STAGED tree** (not the source checkout) and fsync it — files **and**
@@ -148,17 +159,43 @@ liveness cannot be verified and the lock is old, the timeout error explains manu
    targets/backups are verified to be on the **same filesystem** (so a rename can never fail with
    `EXDEV` partway).
 3. **apply** — for each target: revalidate the staged tree against its journaled hash, move any
-   existing dir aside to a backup, then atomically rename the staged dir into place (re-checking the
-   parent for a symlink first and fsyncing both rename parents); then removals; then write the
-   manifest **last** via atomic rename.
+   existing dir aside to a backup, then atomically rename the staged dir into place; then removals;
+   then write the manifest **last** via atomic rename. **Immediately before every rename** (swaps,
+   backups, and removals — after any callback), the source and destination parents are re-checked
+   with non-following `lstat`s and the staged tree is **re-hashed**, so an ancestor swapped for a
+   symlink, or staged bytes modified, after journal validation cannot be followed or installed.
+   Every directory the transaction creates (`.claude`, `.claude/skills`, `.agents`) and every rename
+   parent is fsynced, so a crash cannot leave a durable manifest describing a lost directory.
 4. **cleanup** — remove staging, backups, and the journal (only after a fully successful apply).
+
+**Durability requirement.** The crash-safety above is only as good as `fsync`. Regular-file fsync
+failures are always fatal, and a filesystem that cannot fsync the directories skillsync renames into
+fails with a clear **`DURABILITY_UNSUPPORTED`** error naming the path and platform code (rather than
+a raw errno). Local filesystems (APFS, HFS+, ext4, xfs, btrfs, tmpfs) are supported; some
+network/FUSE mounts and restricted sandboxes are not. A directory fsync the platform reports as a
+no-op (`EINVAL`/`ENOTSUP`) is tolerated.
+
+**Residual TOCTOU limit (documented, not a bug).** Confinement is enforced with non-following
+`lstat`s re-run immediately before each rename, and staging is private (`0700`). Complete
+confinement would require fd-relative, no-follow syscalls (`openat`/`renameat2` with
+`RESOLVE_NO_SYMLINKS`), which **zero-dependency Node cannot express** — `fs.rename` resolves its
+operands by path. A window therefore remains between the final check and the syscall. skillsync
+closes it as far as the platform allows and assumes a **non-hostile local user**: an attacker who
+can already write inside your project as you does not need this race. Adding a native dependency to
+eliminate it is explicitly out of scope (ADR 0003).
 
 **Crash recovery is roll-forward and fail-closed.** At the start of every mutating command, under
 the lock, an interrupted transaction is rolled forward (`apply` is idempotent). A journal is
 executed only after its **MAC authenticates it** as created by a skillsync transaction on **this
 machine** and it is fully path-confined and same-device (all re-checked during recovery). The MAC is
 keyed on a machine-local secret (not the hostname or checkout path), so a hostname change or a
-same-filesystem project move is recovered rather than stranded. When staging is present its hash is
+same-filesystem project move is recovered rather than stranded. That secret
+(`$XDG_CONFIG_HOME/skillsync/secret`) is created **atomically and durably**: 32 random bytes are
+written to a private temp file, fsynced, and published with `link()` — which never clobbers a
+concurrent creator's key — and its directory is fsynced. Every read validates it (regular file,
+exactly 32 bytes, `0600`; a loosened mode is repaired). A wrong-length or non-regular secret is a
+loud `SECRET_INVALID` error: skillsync will **not** silently re-key, because that would reject every
+journal signed with the real one. When staging is present its hash is
 revalidated before the swap; when staging is **absent** the live target hash is verified before the
 swap is treated as complete — "staging missing" is never proof of completion. A corrupt, foreign, or
 tampered journal, or any ambiguity, is refused and **nothing is deleted**: staging, backups, and the
@@ -193,13 +230,17 @@ on a detached HEAD. Plain-mode and read-only operations never require a branch.
 
 The hand-rolled parser reads a leading `---`-delimited block (LF or CRLF) and extracts the keys
 skillsync needs (`name`, `version`, and the display-only `description`) **robustly**, while safely
-**ignoring** any other valid YAML rather than rejecting the whole block. It handles quoted scalars
-with escapes (`\"`, `\\`, `''`), unquoted scalars with trailing `#` comments, integers, booleans,
-`null`/`~`, inline (`[a, b]`) and block (`- a`) sequences, **folded `>` and literal `|` block
-scalars**, and **nested mappings** (consumed and ignored). Decimal tokens (e.g. `1.10`) are kept as
-strings so version pins are never truncated, and a leading UTF-8 BOM is stripped. It still **fails
-closed** on an unterminated quote and on a duplicated `name`/`version` (identity keys must be
-unambiguous), and it never evaluates a `---js` block. Versions are canonicalized with BigInt
+**ignoring** any other valid YAML rather than rejecting the whole block. It handles quoted scalars,
+unquoted scalars with trailing `#` comments, integers, booleans, `null`/`~`, inline (`[a, b]`) and
+block (`- a`) sequences, **folded `>` and literal `|` block scalars**, and **nested mappings**
+(consumed and ignored). Double-quoted strings implement the full **YAML escape table** (`\n`, `\t`,
+`\"`, `\\`, `\0`, `\a`, `\b`, `\v`, `\f`, `\e`, `\N`, `\_`, `\L`, `\P`, and `\xNN` / `\uNNNN` /
+`\UNNNNNNNN`); an **unknown or incomplete escape is rejected** rather than silently dropped, so
+malformed input such as `name: "f\oo"` can no longer be normalized into the valid identity `foo`.
+**Quoted top-level keys** (`"name": …`) are recognized, so they cannot hide a duplicate identity
+key. Decimal tokens (e.g. `1.10`) are kept as strings so version pins are never truncated, and a
+leading UTF-8 BOM is stripped. It still **fails closed** on an unterminated quote and on a duplicated
+`name`/`version` (identity keys must be unambiguous), and it never evaluates a `---js` block. Versions are canonicalized with BigInt
 (leading zeros stripped, arbitrary width) so `01.02` and `1.2` are the same pin and compare equal.
 
 ## Design
