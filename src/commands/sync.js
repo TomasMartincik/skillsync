@@ -1,14 +1,20 @@
 /**
  * `skillsync sync` — materialize EXACTLY what the manifest records.
  *
- * The pin is the recorded `version`; the recorded `commit` is a resolution cache.
+ * The pin is the recorded `version`; the recorded `commit` is only a resolution
+ * cache and is NOT authoritative — if it declares a different version than the
+ * pin (a stale/wrong cache) we ignore it and resolve the version from history.
  * sync never advances pins even if central has moved on (reproducibility is the
- * core promise). Fetch protocol: try the cached commit; if it is unreachable,
- * resolve the version to a commit via first-parent history; verify the fetched
- * tree's hash equals the recorded `sourceHash` before touching project files.
+ * core promise). The fetched tree's `sourceHash` and each STAGED output hash are
+ * verified before the atomic swap.
  *
- * Drift protection: a materialized copy whose hash ≠ the recorded output hash is
- * skipped with a warning; `--force` overwrites it.
+ * Drift/anomaly protection: a materialized copy whose hash ≠ the recorded output
+ * hash (drift), or which cannot be hashed for any reason other than being absent
+ * (anomaly — a symlink/FIFO/oversized/unreadable file swapped in), is skipped
+ * with a warning; only `--force` overwrites it. Only a genuinely absent copy
+ * (ENOENT) is treated as "missing" and re-materialized without `--force`.
+ *
+ * The whole read → recover → plan → apply runs under the project lock.
  *
  * @module commands/sync
  */
@@ -16,15 +22,10 @@
 import path from 'node:path';
 import { readManifest, pinAgents } from '../manifest.js';
 import { preflight } from '../git.js';
-import {
-  checkoutCommit,
-  fullClone,
-  resolveVersionToCommit,
-  findSkillRel,
-} from '../fetch.js';
-import { hashSkillTree, hashFiles } from '../hash.js';
+import { hashSkillTree } from '../hash.js';
 import { adaptForAgent } from '../adapt.js';
-import { runTransaction, hashMaterialized } from '../materialize.js';
+import { stageTargets, commitStaged, hashMaterialized } from '../materialize.js';
+import { PinResolver } from '../pin-resolver.js';
 import { excludeEntriesFor, targetDir } from '../plan.js';
 import { SkillsyncError, log, warn } from '../util.js';
 import { resolveProject, withLock, parseArgs } from './common.js';
@@ -37,148 +38,104 @@ export async function sync(argv, ctx) {
   const { flags } = parseArgs(argv);
   const force = flags.force === true;
   const project = resolveProject(ctx.cwd);
-  const manifest = await readManifest(project.manifestPath);
-  const { warnings } = await preflight(ctx.cwd, { mode: manifest.mode, manifestPath: project.manifestPath });
-  for (const w of warnings) warn(w);
 
-  const names = Object.keys(manifest.skills);
-  if (names.length === 0) {
-    log('nothing to sync (no skills in manifest)');
-    return;
-  }
+  await withLock(ctx.cwd, async () => {
+    const manifest = await readManifest(project.manifestPath);
+    const { warnings } = await preflight(ctx.cwd, { mode: manifest.mode, manifestPath: project.manifestPath });
+    for (const w of warnings) warn(w);
 
-  // Decide which skills need (re)materialization.
-  /** @type {string[]} */
-  const toMaterialize = [];
-  for (const skill of names) {
-    const pin = manifest.skills[skill];
-    const statuses = await Promise.all(
-      pinAgents(pin).map(async (agent) => materializedStatus(ctx.cwd, agent, skill, pin.outputs[agent])),
-    );
-    if (statuses.every((s) => s === 'ok')) continue;
-    if (!force && statuses.some((s) => s === 'drifted')) {
-      warn(`${skill}: materialized copy has drifted; skipping (use --force to overwrite)`);
-      continue;
+    const names = Object.keys(manifest.skills);
+    if (names.length === 0) {
+      log('nothing to sync (no skills in manifest)');
+      return;
     }
-    toMaterialize.push(skill);
-  }
 
-  if (toMaterialize.length === 0) {
-    log('already in sync');
-    return;
-  }
-
-  const resolver = new PinResolver(manifest.source);
-  try {
-    /** @type {import('../materialize.js').TargetWrite[]} */
-    const targets = [];
-    for (const skill of toMaterialize) {
+    // Decide which skills need (re)materialization.
+    /** @type {string[]} */
+    const toMaterialize = [];
+    for (const skill of names) {
       const pin = manifest.skills[skill];
-      const skillDir = await resolver.resolve(skill, pin);
-      // Integrity: the fetched tree must match the recorded source hash.
-      const sourceHash = await hashSkillTree(skillDir);
-      if (sourceHash !== pin.sourceHash) {
-        throw new SkillsyncError(
-          'PIN_MISMATCH',
-          `${skill}: fetched tree hash ${sourceHash} != recorded ${pin.sourceHash}; refusing to materialize`,
-        );
+      const statuses = await Promise.all(
+        pinAgents(pin).map((agent) => materializedStatus(ctx.cwd, agent, skill, pin.outputs[agent])),
+      );
+      if (statuses.every((s) => s === 'ok')) continue;
+      if (!force && statuses.some((s) => s === 'drifted' || s === 'anomaly')) {
+        warn(`${skill}: materialized copy has drifted or anomalous content; skipping (use --force to overwrite)`);
+        continue;
       }
-      for (const agent of pinAgents(pin)) {
-        const files = await adaptForAgent(skillDir, agent);
-        const outHash = await hashFiles(files);
-        if (outHash !== pin.outputs[agent]) {
+      toMaterialize.push(skill);
+    }
+
+    if (toMaterialize.length === 0) {
+      log('already in sync');
+      return;
+    }
+
+    const resolver = new PinResolver(manifest.source);
+    try {
+      /** @type {{ skill: string, agent: string, target: string, files: import('../input-policy.js').SkillFile[], expected: string }[]} */
+      const flatSpecs = [];
+      for (const skill of toMaterialize) {
+        const pin = manifest.skills[skill];
+        const skillDir = await resolver.resolve(skill, pin);
+        // Integrity: the fetched source tree must match the recorded source hash.
+        const sourceHash = await hashSkillTree(skillDir);
+        if (sourceHash !== pin.sourceHash) {
           throw new SkillsyncError(
             'PIN_MISMATCH',
-            `${skill}: ${agent} output hash ${outHash} != recorded ${pin.outputs[agent]}`,
+            `${skill}: fetched tree hash ${sourceHash} != recorded ${pin.sourceHash}; refusing to materialize`,
           );
         }
-        targets.push({ target: targetDir(agent, skill), files });
+        for (const agent of pinAgents(pin)) {
+          const files = await adaptForAgent(skillDir, agent);
+          flatSpecs.push({ skill, agent, target: targetDir(agent, skill), files, expected: pin.outputs[agent] });
+        }
+        log(`sync ${skill}@${pin.version}`);
       }
-      log(`sync ${skill}@${pin.version}`);
-    }
 
-    await withLock(ctx.cwd, async () => {
-      await runTransaction(ctx.cwd, {
+      // Stage, then verify each STAGED output hash equals the recorded pin.
+      const staged = await stageTargets(ctx.cwd, flatSpecs.map((s) => ({ target: s.target, files: s.files })));
+      for (let i = 0; i < flatSpecs.length; i++) {
+        const { skill, agent, expected } = flatSpecs[i];
+        if (staged.targets[i].hash !== expected) {
+          throw new SkillsyncError(
+            'PIN_MISMATCH',
+            `${skill}: ${agent} staged output hash ${staged.targets[i].hash} != recorded ${expected}`,
+          );
+        }
+      }
+
+      await commitStaged(ctx.cwd, {
+        staged,
         manifest, // unchanged: sync does not advance pins
-        targets,
         removeDirs: [],
         excludeEntries: excludeEntriesFor(manifest),
       });
-    });
-  } finally {
-    await resolver.cleanup();
-  }
+    } finally {
+      await resolver.cleanup();
+    }
+  });
 }
 
 /**
- * Classify a materialized copy.
+ * Classify a materialized copy. Only a genuinely absent target is `missing`;
+ * every other failure (integrity/scan/hash error) is an `anomaly` that requires
+ * `--force`, never a silent overwrite (adversarial-review MAJOR: anomalies were
+ * misclassified as missing).
  * @param {string} projectDir
  * @param {string} agent
  * @param {string} skill
  * @param {string} recorded recorded output hash
- * @returns {Promise<'ok'|'missing'|'drifted'>}
+ * @returns {Promise<'ok'|'missing'|'drifted'|'anomaly'>}
  */
 async function materializedStatus(projectDir, agent, skill, recorded) {
   const dir = path.join(projectDir, targetDir(agent, skill));
   let actual;
   try {
     actual = await hashMaterialized(dir);
-  } catch {
-    return 'missing';
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return 'missing';
+    return 'anomaly';
   }
   return actual === recorded ? 'ok' : 'drifted';
-}
-
-/**
- * Resolves version pins to on-disk skill dirs, caching checkouts by commit and
- * lazily full-cloning only when a cached commit is unreachable.
- */
-class PinResolver {
-  /** @param {string} source */
-  constructor(source) {
-    this.source = source;
-    /** @type {Map<string, import('../fetch.js').Checkout>} */
-    this.byCommit = new Map();
-    /** @type {import('../fetch.js').Checkout|null} */
-    this.full = null;
-  }
-
-  /**
-   * @param {string} skill
-   * @param {import('../manifest.js').SkillPin} pin
-   * @returns {Promise<string>} absolute path to the skill dir
-   */
-  async resolve(skill, pin) {
-    // Fast path: the cached commit.
-    let commit = pin.commit;
-    let checkout = await this.checkout(commit).catch((err) => {
-      if (err instanceof SkillsyncError && err.code === 'UNRESOLVABLE_PIN') return null;
-      throw err;
-    });
-    if (!checkout) {
-      // Fallback: resolve the version to a commit via history.
-      if (!this.full) this.full = await fullClone(this.source);
-      commit = await resolveVersionToCommit(this.full.dir, skill, pin.version);
-      checkout = await this.checkout(commit);
-    }
-    const rel = await findSkillRel(checkout.dir, skill);
-    return path.join(checkout.dir, rel);
-  }
-
-  /**
-   * @param {string} commit
-   * @returns {Promise<import('../fetch.js').Checkout>}
-   */
-  async checkout(commit) {
-    const cached = this.byCommit.get(commit);
-    if (cached) return cached;
-    const c = await checkoutCommit(this.source, commit);
-    this.byCommit.set(commit, c);
-    return c;
-  }
-
-  async cleanup() {
-    for (const c of this.byCommit.values()) await c.cleanup();
-    if (this.full) await this.full.cleanup();
-  }
 }

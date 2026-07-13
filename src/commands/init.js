@@ -27,10 +27,6 @@ export async function init(argv, ctx) {
   const { flags } = parseArgs(argv, { valueFlags: ['source', 'mode'] });
   const project = resolveProject(ctx.cwd);
 
-  if (await pathExists(project.manifestPath)) {
-    throw new SkillsyncError('ALREADY_INIT', `already initialized: ${MANIFEST_PATH} exists`);
-  }
-
   // Mode.
   let mode;
   if (typeof flags.mode === 'string') {
@@ -57,13 +53,18 @@ export async function init(argv, ctx) {
     }
   }
 
-  // Preflight git for committed/gitignored.
-  const { warnings } = await preflight(ctx.cwd, { mode, manifestPath: project.manifestPath });
-  for (const w of warnings) warn(w);
-
   const manifest = emptyManifest({ source, mode });
 
   await withLock(ctx.cwd, async () => {
+    // Under the lock and after recovery: refuse if already initialized (a crashed
+    // init is first rolled forward by recover(), then seen here as initialized).
+    if (await pathExists(project.manifestPath)) {
+      throw new SkillsyncError('ALREADY_INIT', `already initialized: ${MANIFEST_PATH} exists`);
+    }
+    // Preflight git for committed/gitignored.
+    const { warnings } = await preflight(ctx.cwd, { mode, manifestPath: project.manifestPath });
+    for (const w of warnings) warn(w);
+
     await runTransaction(ctx.cwd, {
       manifest,
       targets: [],

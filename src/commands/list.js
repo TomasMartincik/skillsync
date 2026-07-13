@@ -42,18 +42,22 @@ export async function list(argv, ctx) {
 }
 
 /**
+ * Only a genuinely absent copy is `missing`; any other hashing failure is an
+ * `anomaly` (integrity violation), not `missing` (adversarial-review MAJOR:
+ * anomalies were reported as missing).
  * @param {string} projectDir
  * @param {string} agent
  * @param {string} skill
  * @param {string} recorded
- * @returns {Promise<'ok'|'missing'|'drifted'>}
+ * @returns {Promise<'ok'|'missing'|'drifted'|'anomaly'>}
  */
 async function statusFor(projectDir, agent, skill, recorded) {
   const dir = path.join(projectDir, targetDir(agent, skill));
   try {
     const actual = await hashMaterialized(dir);
     return actual === recorded ? 'ok' : 'drifted';
-  } catch {
-    return 'missing';
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return 'missing';
+    return 'anomaly';
   }
 }

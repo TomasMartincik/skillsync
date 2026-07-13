@@ -25,11 +25,29 @@ import os from 'node:os';
 import path from 'node:path';
 import { git, gitOrThrow } from './git.js';
 import { parseFrontmatter } from './frontmatter.js';
+import { assertSkillName } from './skill-name.js';
 import { SkillsyncError } from './util.js';
 
 /** @returns {Promise<string>} a fresh temp directory */
 export async function mkTmp() {
   return fs.mkdtemp(path.join(os.tmpdir(), 'skillsync-'));
+}
+
+/**
+ * Normalize a clone source for safe use as a git operand. A URL or scp-like
+ * remote (`https://…`, `git@host:…`) is passed through unchanged; anything else
+ * is treated as a local path and resolved to an absolute path so a relative name
+ * beginning with `-` can never be mistaken for a git option. The caller also
+ * places `--` before the operand as belt-and-suspenders.
+ * @param {string} source
+ * @returns {string}
+ */
+export function cloneOperand(source) {
+  const s = String(source);
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(s)) return s; // scheme://…
+  if (/^[^/\s]+@[^/\s]+:/.test(s)) return s; // scp-like user@host:path
+  if (s.startsWith('file://')) return s;
+  return path.resolve(s); // local path -> absolute
 }
 
 /**
@@ -48,7 +66,9 @@ export async function mkTmp() {
 export async function shallowClone(source) {
   const dir = await mkTmp();
   try {
-    await gitOrThrow(['clone', '--depth', '1', '--quiet', source, dir], { code: 'CLONE_FAILED' });
+    await gitOrThrow(['clone', '--depth', '1', '--quiet', '--', cloneOperand(source), dir], {
+      code: 'CLONE_FAILED',
+    });
   } catch (err) {
     await rm(dir);
     throw err;
@@ -69,7 +89,7 @@ export async function checkoutCommit(source, commit) {
   const dir = await mkTmp();
   try {
     await gitOrThrow(['init', '-q'], { cwd: dir });
-    await gitOrThrow(['remote', 'add', 'origin', source], { cwd: dir });
+    await gitOrThrow(['remote', 'add', 'origin', cloneOperand(source)], { cwd: dir });
     await ensureCommit(dir, commit);
     // Detach onto the commit and populate the working tree.
     await gitOrThrow(['-c', 'advice.detachedHead=false', 'checkout', '-q', commit], { cwd: dir });
@@ -130,7 +150,7 @@ async function hasCommit(dir, commit) {
 export async function fullClone(source) {
   const dir = await mkTmp();
   try {
-    await gitOrThrow(['clone', '--quiet', source, dir], { code: 'CLONE_FAILED' });
+    await gitOrThrow(['clone', '--quiet', '--', cloneOperand(source), dir], { code: 'CLONE_FAILED' });
   } catch (err) {
     await rm(dir);
     throw err;
@@ -140,26 +160,42 @@ export async function fullClone(source) {
 }
 
 /**
- * Resolve a version pin to the newest first-parent commit whose skill declares
- * that version. Rejects regressed versions (non-monotonic first-parent history).
+ * @typedef {Object} Publication
+ * @property {string} skillRel POSIX rel path to the skill dir in the checkout
+ * @property {{ commit: string, version: string, tree: string }[]} observed
+ *   first-parent history newest -> oldest, one entry per commit where the skill
+ *   exists; `tree` is the git tree object id of the skill dir (content identity).
+ */
+
+/**
+ * Scan a skill's first-parent publication history and enforce the central-repo
+ * invariants (adversarial-review MAJOR: duplicate versions / no `add` validation):
+ *   - versions are monotonically non-decreasing over time (no regression);
+ *   - each version maps to exactly ONE canonical skill tree — a version reused
+ *     across a real content change (the skill tree object id differs) is rejected
+ *     as a duplicate, because an old project pinning content A and a new project
+ *     pinning content B under the same version cannot both resolve correctly.
  * @param {string} dir a full clone
  * @param {string} skill skill name
- * @param {string} version target version, e.g. "1.2"
- * @returns {Promise<string>} commit SHA
+ * @returns {Promise<Publication>}
  */
-export async function resolveVersionToCommit(dir, skill, version) {
+export async function scanPublication(dir, skill) {
+  assertSkillName(skill);
   const skillRel = await findSkillRel(dir, skill);
   const revs = (await gitOrThrow(['rev-list', '--first-parent', 'HEAD'], { cwd: dir }))
     .split('\n')
     .filter(Boolean);
 
-  /** @type {{ commit: string, version: string }[]} */
+  /** @type {Publication['observed']} */
   const observed = [];
   for (const commit of revs) {
     const v = await readSkillVersionAt(dir, commit, skillRel);
-    if (v !== null) observed.push({ commit, version: v });
+    if (v === null) continue;
+    const tree = await treeShaAt(dir, commit, skillRel);
+    observed.push({ commit, version: v, tree });
   }
-  // observed is newest -> oldest; versions must be monotonically non-increasing.
+
+  // Monotonicity: newest -> oldest, versions must be non-increasing.
   for (let i = 1; i < observed.length; i++) {
     if (compareVersions(observed[i - 1].version, observed[i].version) < 0) {
       throw new SkillsyncError(
@@ -168,6 +204,45 @@ export async function resolveVersionToCommit(dir, skill, version) {
       );
     }
   }
+
+  // Uniqueness: a version must correspond to exactly one canonical tree.
+  /** @type {Map<string, string>} */
+  const versionTree = new Map();
+  for (const o of observed) {
+    const prev = versionTree.get(o.version);
+    if (prev !== undefined && prev !== o.tree) {
+      throw new SkillsyncError(
+        'DUPLICATE_VERSION',
+        `skill "${skill}" reuses version ${o.version} for two different skill trees; central must bump the version on every content change`,
+      );
+    }
+    if (prev === undefined) versionTree.set(o.version, o.tree);
+  }
+
+  return { skillRel, observed };
+}
+
+/**
+ * Validate a skill's publication history (used by `add`, which otherwise only
+ * sees HEAD). Throws VERSION_REGRESSION / DUPLICATE_VERSION on a broken history.
+ * @param {string} dir a full clone
+ * @param {string} skill
+ * @returns {Promise<void>}
+ */
+export async function validatePublication(dir, skill) {
+  await scanPublication(dir, skill);
+}
+
+/**
+ * Resolve a version pin to the newest first-parent commit whose skill declares
+ * that version, after enforcing the publication invariants.
+ * @param {string} dir a full clone
+ * @param {string} skill skill name
+ * @param {string} version target version, e.g. "1.2"
+ * @returns {Promise<string>} commit SHA
+ */
+export async function resolveVersionToCommit(dir, skill, version) {
+  const { observed } = await scanPublication(dir, skill);
   const match = observed.find((o) => o.version === version);
   if (!match) {
     throw new SkillsyncError(
@@ -192,6 +267,18 @@ async function readSkillVersionAt(dir, commit, skillRel) {
 }
 
 /**
+ * Git tree object id of the skill directory at `commit` — a content-identity for
+ * the whole skill tree (two commits with identical skill content share it).
+ * @param {string} dir
+ * @param {string} commit
+ * @param {string} skillRel
+ * @returns {Promise<string>}
+ */
+async function treeShaAt(dir, commit, skillRel) {
+  return gitOrThrow(['rev-parse', `${commit}:${skillRel}`], { cwd: dir });
+}
+
+/**
  * Locate the skill directory (the one containing SKILL.md) within a checkout.
  * Prefers `<root>/<skill>/SKILL.md`, then searches shallowly.
  * @param {string} dir checkout root
@@ -199,6 +286,7 @@ async function readSkillVersionAt(dir, commit, skillRel) {
  * @returns {Promise<string>} POSIX relative path of the skill dir
  */
 export async function findSkillRel(dir, skill) {
+  assertSkillName(skill);
   const direct = path.join(dir, skill, 'SKILL.md');
   if (await exists(direct)) return skill;
 
