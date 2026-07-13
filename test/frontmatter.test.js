@@ -48,3 +48,37 @@ test('does NOT eval a ---js block (treated as no frontmatter)', () => {
   const { data } = parseFrontmatter('---js\nmodule.exports = {}\n---\n');
   assert.deepEqual(data, {});
 });
+
+test('quoted scalar followed by a trailing comment parses cleanly', () => {
+  const { data } = parseFrontmatter('---\nversion: "1.0" # release\n---\n');
+  assert.equal(data.version, '1.0');
+});
+
+test('a leading UTF-8 BOM does not hide the frontmatter', () => {
+  const { data } = parseFrontmatter('﻿---\nname: x\nversion: 1.0\n---\nbody');
+  assert.equal(data.name, 'x');
+  assert.equal(data.version, '1.0');
+});
+
+test('duplicate keys are rejected (fail closed)', () => {
+  assert.throws(
+    () => parseFrontmatter('---\nversion: 1.0\nversion: 2.0\n---\n'),
+    (err) => err.code === 'BAD_FRONTMATTER' && /duplicate/.test(err.message),
+  );
+});
+
+test('unsupported lines (nested map) are rejected, not silently dropped', () => {
+  assert.throws(
+    () => parseFrontmatter('---\nname: x\nnested:\n  a: 1\n---\n'),
+    (err) => err.code === 'BAD_FRONTMATTER',
+  );
+});
+
+test('unterminated quotes fail closed', () => {
+  assert.throws(() => parseFrontmatter('---\nname: "oops\n---\n'), (err) => err.code === 'BAD_FRONTMATTER');
+});
+
+test('quoted commas inside a flow sequence are not split', () => {
+  const { data } = parseFrontmatter('---\nitems: ["a,b", c]\n---\n');
+  assert.deepEqual(data.items, ['a,b', 'c']);
+});

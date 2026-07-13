@@ -4,10 +4,38 @@
  * @module test/helpers
  */
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+
+/** Absolute path to the CLI entry point (for real-subprocess tests). */
+export const BIN = path.join(HERE, '..', 'bin', 'skillsync.js');
+
+/**
+ * Run the skillsync CLI as a real child process.
+ * @param {string[]} args
+ * @param {{ cwd: string, env?: Record<string,string> }} opts
+ * @returns {Promise<{ code: number, stdout: string, stderr: string }>}
+ */
+export function runCli(args, opts) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [BIN, ...args], {
+      cwd: opts.cwd,
+      env: { ...process.env, ...(opts.env ?? {}) },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => (stdout += d));
+    child.stderr.on('data', (d) => (stderr += d));
+    child.on('error', reject);
+    child.on('close', (code) => resolve({ code: code ?? 0, stdout, stderr }));
+  });
+}
 
 /** @returns {Promise<string>} */
 export async function tmpDir() {

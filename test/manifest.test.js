@@ -56,6 +56,24 @@ test('validation rejects bad version/commit/hash/mode', () => {
   assert.throws(() => validateManifest(bad3), /unknown agent/);
 });
 
+test('outputs must equal the selected agent set', () => {
+  // agents:["codex"] but empty outputs -> invalid state, rejected up front.
+  const bad = sampleManifest();
+  bad.skills.alpha.outputs = {};
+  assert.throws(() => validateManifest(bad), /outputs must have exactly one hash per selected agent/);
+
+  // full-agent pin missing one output -> rejected.
+  const bad2 = sampleManifest();
+  delete bad2.skills.zeta.outputs.codex;
+  assert.throws(() => validateManifest(bad2), /outputs must have exactly one hash per selected agent/);
+});
+
+test('rejects an invalid skill key (name grammar)', () => {
+  const bad = sampleManifest();
+  bad.skills['Bad Name'] = bad.skills.zeta;
+  assert.throws(() => validateManifest(bad), /valid skill name/);
+});
+
 test('emptyManifest + read from disk', async () => {
   const dir = await tmpDir();
   try {
