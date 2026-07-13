@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import {
   checkoutCommit,
+  cloneOperand,
   fullClone,
   resolveVersionToCommit,
   findSkillRel,
@@ -19,6 +20,25 @@ test('normalizeVersion / compareVersions', () => {
   assert.ok(compareVersions('1.2', '1.10') < 0);
   assert.ok(compareVersions('2.0', '1.9') > 0);
   assert.equal(compareVersions('1.1', '1.1'), 0);
+});
+
+test('versions canonicalize leading zeros and compare with BigInt', () => {
+  // Leading zeros canonicalize to the same key (no distinct-but-equal versions).
+  assert.equal(normalizeVersion('01.02'), '1.2');
+  assert.equal(normalizeVersion('1.10'), '1.10'); // minor not truncated to 1.1
+  assert.equal(compareVersions('01.2', '1.2'), 0);
+  assert.ok(compareVersions('1.02', '1.10') < 0);
+  // Arbitrarily large components (beyond float precision) still compare correctly.
+  assert.ok(compareVersions('1.9999999999999999', '1.10000000000000000') < 0);
+});
+
+test('cloneOperand recognizes scp shorthand with and without a username', () => {
+  assert.equal(cloneOperand('github.com:owner/repo.git'), 'github.com:owner/repo.git');
+  assert.equal(cloneOperand('git@github.com:owner/repo.git'), 'git@github.com:owner/repo.git');
+  assert.equal(cloneOperand('https://example.com/x.git'), 'https://example.com/x.git');
+  assert.equal(cloneOperand('file:///tmp/x'), 'file:///tmp/x');
+  // A colon AFTER a slash is a local path (resolved to absolute), not scp.
+  assert.equal(cloneOperand('./a:b'), path.resolve('./a:b'));
 });
 
 test('checkoutCommit reproduces an exact historical commit', async () => {

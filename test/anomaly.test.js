@@ -61,3 +61,39 @@ test('an anomalous materialized copy is skipped without --force and reported by 
     await rmrf(root);
   }
 });
+
+/**
+ * Adversarial-review MAJOR: the TARGET ROOT was never lstat'd, so a materialized
+ * skill dir REPLACED by a symlink (even to a tree with the expected bytes) could
+ * be followed and reported `ok`. It must be an anomaly, and `sync` must not
+ * silently overwrite it.
+ */
+test('a symlinked target ROOT is an anomaly, not ok/missing', async () => {
+  const root = await tmpDir();
+  try {
+    await withIsolatedConfig(root, async () => {
+      const central = await makeCentral(path.join(root, 'central'), [
+        { message: 'v1.0', skill: { name: 'foo', version: '1.0', body: 'ONE' } },
+      ]);
+      const proj = path.join(root, 'proj');
+      await fs.mkdir(proj, { recursive: true });
+      await init(['--source', central.dir, '--mode', 'plain'], { cwd: proj });
+      await add(['foo'], { cwd: proj });
+
+      // Replace the whole claude skill dir with a symlink to an external tree that
+      // happens to contain the same bytes.
+      const external = path.join(root, 'external-foo');
+      await fs.cp(path.join(proj, '.claude/skills/foo'), external, { recursive: true });
+      await fs.rm(path.join(proj, '.claude/skills/foo'), { recursive: true, force: true });
+      await fs.symlink(external, path.join(proj, '.claude/skills/foo'));
+
+      const listed = await runCli(['list'], { cwd: proj, env: { XDG_CONFIG_HOME: path.join(root, 'xdg') } });
+      assert.match(listed.stdout, /claude:anomaly/);
+
+      await sync([], { cwd: proj }); // must not overwrite the anomalous symlinked root
+      assert.ok((await fs.lstat(path.join(proj, '.claude/skills/foo'))).isSymbolicLink());
+    });
+  } finally {
+    await rmrf(root);
+  }
+});

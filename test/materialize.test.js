@@ -1,12 +1,17 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { runTransaction, recover } from '../src/materialize.js';
 import { scanSkillTree } from '../src/input-policy.js';
 import { serializeManifest } from '../src/manifest.js';
 import { TXN_FILE } from '../src/constants.js';
 import { writeSkill, tmpDir, rmrf } from './helpers.js';
+
+// Isolate the machine secret (used to MAC journals) into a throwaway dir so these
+// direct-transaction tests never touch the real ~/.config/skillsync.
+process.env.XDG_CONFIG_HOME = path.join(os.tmpdir(), `skillsync-secret-materialize-${process.pid}`);
 
 const H = 'sha256:' + 'a'.repeat(64);
 
@@ -111,6 +116,55 @@ test('recovery completes a crash between dir swaps and manifest write', async ()
     await rmrf(root);
   }
 });
+
+test('the swap installs a COMPLETE tree via a single rename (atomic visibility)', async () => {
+  const root = await tmpDir();
+  try {
+    const proj = path.join(root, 'proj');
+    // Pre-existing target with old content that must vanish atomically.
+    await fs.mkdir(path.join(proj, '.claude/skills/g'), { recursive: true });
+    await fs.writeFile(path.join(proj, '.claude/skills/g/OLD.md'), 'old');
+
+    const src = path.join(root, 'src', 'g');
+    await writeSkill(src, { name: 'g', version: '1.0', files: { 'r/n.md': 'nested', 'b.md': 'bee' } });
+    const target = path.join(proj, '.claude/skills/g');
+
+    let absentDuringBackup = false;
+    let completeAtRename = false;
+    await runTransaction(proj, await onePlan(root, src), async (phase) => {
+      if (phase === 'swap.0.post-backup') {
+        // The old dir has been moved aside; the target is momentarily absent —
+        // it is NEVER observed as a partially-populated mix of old and new.
+        absentDuringBackup = !(await pathExists(target));
+      }
+      if (phase === 'swap.0.post-rename') {
+        // After the single staged->target rename the WHOLE new tree is present at
+        // once (no partially-copied intermediate), and the old file is gone.
+        const hasAll =
+          (await pathExists(path.join(target, 'SKILL.md'))) &&
+          (await pathExists(path.join(target, 'b.md'))) &&
+          (await pathExists(path.join(target, 'r/n.md')));
+        const oldGone = !(await pathExists(path.join(target, 'OLD.md')));
+        completeAtRename = hasAll && oldGone;
+      }
+    });
+
+    assert.ok(absentDuringBackup, 'target must be absent (not partial) between backup and rename');
+    assert.ok(completeAtRename, 'the whole new tree must appear in one atomic rename');
+    await assert.rejects(fs.stat(path.join(target, 'OLD.md')));
+  } finally {
+    await rmrf(root);
+  }
+});
+
+async function pathExists(p) {
+  try {
+    await fs.lstat(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 test('atomic swap replaces an existing dir (old content gone)', async () => {
   const root = await tmpDir();

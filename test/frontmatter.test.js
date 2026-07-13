@@ -67,11 +67,28 @@ test('duplicate keys are rejected (fail closed)', () => {
   );
 });
 
-test('unsupported lines (nested map) are rejected, not silently dropped', () => {
-  assert.throws(
-    () => parseFrontmatter('---\nname: x\nnested:\n  a: 1\n---\n'),
-    (err) => err.code === 'BAD_FRONTMATTER',
-  );
+test('a nested mapping is accepted (ignored) and required keys still parse', () => {
+  const { data } = parseFrontmatter('---\nname: x\nversion: 1.0\nnested:\n  a: 1\n  b: 2\n---\n');
+  assert.equal(data.name, 'x');
+  assert.equal(data.version, '1.0');
+  assert.deepEqual(data.nested, {});
+});
+
+test('escaped quotes inside a double-quoted string parse', () => {
+  const { data } = parseFrontmatter('---\ndescription: "say \\"hello\\" now"\n---\n');
+  assert.equal(data.description, 'say "hello" now');
+});
+
+test('folded and literal block scalars parse as the de-indented text', () => {
+  const folded = parseFrontmatter('---\nname: x\ndescription: >-\n  one two\n  three\n---\n');
+  assert.equal(folded.data.description, 'one two three');
+  const literal = parseFrontmatter('---\nname: x\ndescription: |\n  line one\n  line two\n---\n');
+  assert.equal(literal.data.description, 'line one\nline two');
+});
+
+test('single-quote doubling escapes a quote', () => {
+  const { data } = parseFrontmatter("---\na: 'it''s fine'\n---\n");
+  assert.equal(data.a, "it's fine");
 });
 
 test('unterminated quotes fail closed', () => {

@@ -108,14 +108,17 @@ credentials; there is no persistent per-machine clone.
 
 - `add` full-clones central, records the HEAD commit and the skill's frontmatter version, and
   **validates the skill's publication history** (versions must be unique and monotonic — a version
-  reused across a real skill-tree change, or a regression, is rejected).
+  reused across a real skill-tree change, or a regression, is rejected). History is walked by
+  enumerating the **first-parent boundaries** that changed the skill's `SKILL.md` and locating the
+  skill directory **at each boundary**, so a skill that moved (e.g. `old/foo` → `new/foo`) keeps
+  every historical release resolvable.
 - `sync` reproduces the recorded **version**. The recorded `commit` is only a resolution cache and
-  is **not authoritative**: it is used only if the skill at that commit actually declares the pinned
-  version. Retrieval escalates:
-  1. **cache** — fetch the recorded commit; accept it only if it declares the pinned version;
+  is **not authoritative**: it is accepted only if the skill at that commit declares the pinned
+  version **and** its tree matches the recorded `sourceHash`. Retrieval escalates:
+  1. **cache** — fetch the recorded commit; accept it only if version and tree both match;
   2. **fast path / deepen / full** — `git fetch --depth 1 origin <commit>`, then `--deepen` in
      steps, then unshallow / fetch all branches;
-  3. if the cache is stale/wrong or unreachable, resolve the pinned **version** to a commit by
+  3. if the cache is stale/wrong-tree/unreachable, resolve the pinned **version** to a commit by
      walking **first-parent** history (again enforcing uniqueness + monotonicity).
   The fetched tree's hash is checked against the recorded `sourceHash`, **and each staged output
   hash against the recorded per-agent hash**, before any project file is swapped; a mismatch aborts
@@ -124,29 +127,42 @@ credentials; there is no persistent per-machine clone.
 ## Transactional materialization
 
 A mutation is one transaction, with the **project lock acquired first** and held across the whole
-`recover → read manifest → plan → apply` sequence. The lock is a directory published atomically by
-`rename` (with a random ownership token); acquisition **waits** for a concurrent holder and reclaims
-a lock only when its recorded pid is provably dead on this host, so two concurrent commands queue
-and both complete.
+`recover → read manifest → plan → apply` sequence. Before the lock is taken, the project container
+is validated with non-following `lstat`s — a symlinked `.agents/` is refused, never followed out of
+the project. The lock is a directory published atomically by `rename` (with a random ownership
+token); acquisition **waits** for a concurrent holder and reclaims a lock only when its recorded
+holder is provably gone on this host — the pid no longer exists, or the pid exists but its process
+**start time** differs from the recorded one (so a reused pid does not strand the lock). When
+liveness cannot be verified and the lock is old, the timeout error explains manual recovery.
 
 1. **stage** — generate each target's artifact into a private staging area under `.agents/`, then
-   **scan, validate, and hash the STAGED tree** (not the source checkout) and fsync it. The staged
-   hash is authoritative — it is what the manifest records (`add`) or is verified against (`sync`).
+   **scan, validate, and hash the STAGED tree** (not the source checkout) and fsync it — files **and**
+   every nested directory. Regular-file fsync errors are fatal (a partial staged tree must never be
+   committed). The staged hash is authoritative — it is what the manifest records (`add`) or is
+   verified against (`sync`), and what recovery revalidates before every swap.
 2. **journal** — atomically write `.agents/.skillsync-txn.json` recording the complete next state as
-   **project-relative** paths plus this machine/project identity. Before journaling, every path is
-   confined to an allowed skills root beneath the project, symlinked ancestors are rejected, and
-   staging + targets are verified to be on the **same filesystem** (so the swap can never fail with
+   **project-relative** paths, the authoritative staged hash per swap, and a **MAC** over the whole
+   body under a machine-local secret. Before journaling, the complete next manifest is validated,
+   every concrete staged/target/backup path is confined to an allowed root beneath the project,
+   symlinked ancestors are rejected, duplicate target/backup paths are rejected, and staging + all
+   targets/backups are verified to be on the **same filesystem** (so a rename can never fail with
    `EXDEV` partway).
-3. **apply** — for each target: move any existing dir aside to a backup, then atomically rename the
-   staged dir into place; then removals; then write the manifest **last** via atomic rename.
+3. **apply** — for each target: revalidate the staged tree against its journaled hash, move any
+   existing dir aside to a backup, then atomically rename the staged dir into place (re-checking the
+   parent for a symlink first and fsyncing both rename parents); then removals; then write the
+   manifest **last** via atomic rename.
 4. **cleanup** — remove staging, backups, and the journal (only after a fully successful apply).
 
 **Crash recovery is roll-forward and fail-closed.** At the start of every mutating command, under
 the lock, an interrupted transaction is rolled forward (`apply` is idempotent). A journal is
-executed only after it is authenticated as created by a skillsync transaction **for this project on
-this host** and fully path-confined; a corrupt, foreign, or malicious journal is refused and
-**nothing is deleted**. If roll-forward fails partway, staging, backups, and the journal are
-**preserved** for repair — never swept.
+executed only after its **MAC authenticates it** as created by a skillsync transaction on **this
+machine** and it is fully path-confined and same-device (all re-checked during recovery). The MAC is
+keyed on a machine-local secret (not the hostname or checkout path), so a hostname change or a
+same-filesystem project move is recovered rather than stranded. When staging is present its hash is
+revalidated before the swap; when staging is **absent** the live target hash is verified before the
+swap is treated as complete — "staging missing" is never proof of completion. A corrupt, foreign, or
+tampered journal, or any ambiguity, is refused and **nothing is deleted**: staging, backups, and the
+journal are **preserved** for repair.
 
 ## Filesystem input policy
 
@@ -173,16 +189,18 @@ Before a mutating operation in `committed`/`gitignored` mode, skillsync refuses 
 in-progress merge/rebase/cherry-pick and refuses a manifest containing conflict markers; it warns
 on a detached HEAD. Plain-mode and read-only operations never require a branch.
 
-## YAML frontmatter subset
+## YAML frontmatter reader
 
-The hand-rolled parser supports a deliberately small subset: a leading `---`-delimited block
-(LF or CRLF) of **top-level** `key: value` entries only — quoted/unquoted string scalars, integers,
-booleans, `null`/`~`, and both inline (`[a, b]`) and block (`- a`) sequences of scalars; full-line
-`#` comments and blanks are ignored. Decimal tokens (e.g. `1.10`) are kept as strings so version
-pins are never truncated. It handles a leading UTF-8 BOM, trailing comments after quoted scalars,
-and quoted commas inside flow sequences, and **fails closed** on anything ambiguous (duplicate keys,
-unterminated quotes, unsupported/nested lines) rather than mis-parsing. Nested maps, anchors,
-multi-line scalars, and tags are not supported. It never evaluates `---js` blocks.
+The hand-rolled parser reads a leading `---`-delimited block (LF or CRLF) and extracts the keys
+skillsync needs (`name`, `version`, and the display-only `description`) **robustly**, while safely
+**ignoring** any other valid YAML rather than rejecting the whole block. It handles quoted scalars
+with escapes (`\"`, `\\`, `''`), unquoted scalars with trailing `#` comments, integers, booleans,
+`null`/`~`, inline (`[a, b]`) and block (`- a`) sequences, **folded `>` and literal `|` block
+scalars**, and **nested mappings** (consumed and ignored). Decimal tokens (e.g. `1.10`) are kept as
+strings so version pins are never truncated, and a leading UTF-8 BOM is stripped. It still **fails
+closed** on an unterminated quote and on a duplicated `name`/`version` (identity keys must be
+unambiguous), and it never evaluates a `---js` block. Versions are canonicalized with BigInt
+(leading zeros stripped, arbitrary width) so `01.02` and `1.2` are the same pin and compare equal.
 
 ## Design
 

@@ -43,6 +43,42 @@ test('resolveVersionToCommit rejects a duplicate version at a content boundary',
   }
 });
 
+/**
+ * Adversarial-review MAJOR: history broke when a skill directory moved — the path
+ * was found once at HEAD and applied to every ancestor, so pre-move releases
+ * vanished. The skill dir is now located PER first-parent boundary.
+ */
+test('publication history survives a skill directory move (old/foo -> new/foo)', async () => {
+  const root = await tmpDir();
+  try {
+    const central = path.join(root, 'central');
+    await fs.mkdir(path.join(central, 'old'), { recursive: true });
+    gitSync(central, ['init', '-q', '-b', 'main']);
+    await writeSkill(path.join(central, 'old', 'foo'), { name: 'foo', version: '1.0', body: 'A' });
+    gitSync(central, ['add', '-A']);
+    gitSync(central, ['commit', '-q', '-m', 'v1.0 at old/foo']);
+    const c10 = gitSync(central, ['rev-parse', 'HEAD']);
+
+    // Move old/foo -> new/foo AND bump to 1.1 in the same commit.
+    await fs.rm(path.join(central, 'old', 'foo'), { recursive: true, force: true });
+    await writeSkill(path.join(central, 'new', 'foo'), { name: 'foo', version: '1.1', body: 'B' });
+    gitSync(central, ['add', '-A']);
+    gitSync(central, ['commit', '-q', '-m', 'move to new/foo @1.1']);
+    const c11 = gitSync(central, ['rev-parse', 'HEAD']);
+
+    const clone = await fullClone(central);
+    try {
+      // Both the pre-move (old path) and post-move (new path) releases resolve.
+      assert.equal(await resolveVersionToCommit(clone.dir, 'foo', '1.0'), c10);
+      assert.equal(await resolveVersionToCommit(clone.dir, 'foo', '1.1'), c11);
+    } finally {
+      await clone.cleanup();
+    }
+  } finally {
+    await rmrf(root);
+  }
+});
+
 test('add validates publication history and rejects a duplicate version', async () => {
   const root = await tmpDir();
   try {
