@@ -185,33 +185,57 @@ export async function fullClone(source) {
  *     across a real content change (the skill tree object id differs) is rejected.
  *
  * The skill directory is located PER BOUNDARY, not once at HEAD, so a rename such
- * as `old/foo` -> `new/foo` keeps every historical release visible. We enumerate
- * the first-parent commits that actually changed the skill's SKILL.md at any depth
- * (few boundaries) rather than probing every first-parent commit.
+ * as `old/foo` -> `new/foo` keeps every historical release visible. Boundaries are
+ * the first-parent commits that changed ANYTHING in the skill's directory — not
+ * just its `SKILL.md` (round-3 review MAJOR: a commit touching only
+ * `scripts/helper.js` was not a boundary, so two DIFFERENT whole-skill trees could
+ * be published under one version and the duplicate-version invariant it is the
+ * whole point of this scan to enforce was defeated).
  * @param {string} dir a full clone
  * @param {string} skill skill name
  * @returns {Promise<Publication>}
  */
 export async function scanPublication(dir, skill) {
   assertSkillName(skill);
-  // First-parent boundaries where this skill's SKILL.md changed, at ANY depth.
+  // First-parent boundaries where ANY file under a directory named `<skill>` (at
+  // any depth, including the repo root) changed. Both pathspecs are passed for
+  // portability across git's glob handling of a leading `**/`.
   const boundaries = (
     await gitOrThrow(
-      ['log', '--first-parent', '--format=%H', '--', `:(glob)**/${skill}/SKILL.md`],
+      [
+        'log',
+        '--first-parent',
+        '--format=%H',
+        '--',
+        `:(glob)**/${skill}/**`,
+        `:(glob)${skill}/**`,
+      ],
       { cwd: dir },
     )
   )
     .split('\n')
     .filter(Boolean);
 
-  /** @type {Publication['observed']} */
-  const observed = [];
+  // Locate the skill dir at each boundary (one ls-tree per boundary), then resolve
+  // every boundary's tree id in ONE batched `cat-file` call — this runs under the
+  // project lock, so the git call count must stay bounded, not grow 3x per commit.
+  /** @type {{ commit: string, rel: string }[]} */
+  const located = [];
   for (const commit of boundaries) {
     const rel = await findSkillRelAt(dir, skill, commit); // path AT this boundary
     if (rel === null) continue; // a deletion boundary
+    located.push({ commit, rel });
+  }
+  const trees = await batchTreeShas(dir, located.map((l) => `${l.commit}:${l.rel}`));
+
+  /** @type {Publication['observed']} */
+  const observed = [];
+  for (let i = 0; i < located.length; i++) {
+    const { commit, rel } = located[i];
+    const tree = trees[i];
+    if (!tree) continue; // not a tree at this boundary (defensive)
     const v = await readSkillVersionAt(dir, commit, rel);
     if (v === null) continue;
-    const tree = await treeShaAt(dir, commit, rel);
     observed.push({ commit, version: v, tree, rel });
   }
 
@@ -320,15 +344,31 @@ async function readSkillVersionAt(dir, commit, skillRel) {
 }
 
 /**
- * Git tree object id of the skill directory at `commit` — a content-identity for
- * the whole skill tree (two commits with identical skill content share it).
+ * Git tree object ids for a list of `<commit>:<skillRel>` revisions, resolved in a
+ * SINGLE `git cat-file --batch-check` process (one git invocation for the whole
+ * history scan instead of one per boundary). A tree id is the content-identity of
+ * the whole skill directory: two commits with identical skill content share it.
  * @param {string} dir
- * @param {string} commit
- * @param {string} skillRel
- * @returns {Promise<string>}
+ * @param {string[]} specs
+ * @returns {Promise<(string|null)[]>} tree id per input, null when absent/not a tree
  */
-async function treeShaAt(dir, commit, skillRel) {
-  return gitOrThrow(['rev-parse', `${commit}:${skillRel}`], { cwd: dir });
+async function batchTreeShas(dir, specs) {
+  if (specs.length === 0) return [];
+  const r = await git(['cat-file', '--batch-check'], { cwd: dir, input: `${specs.join('\n')}\n` });
+  if (r.code !== 0) {
+    throw new SkillsyncError('GIT_FAILED', `git cat-file --batch-check failed (${r.code}): ${r.stderr.trim()}`);
+  }
+  const lines = r.stdout.split('\n').filter((l) => l !== '');
+  if (lines.length !== specs.length) {
+    throw new SkillsyncError(
+      'GIT_FAILED',
+      `git cat-file --batch-check returned ${lines.length} results for ${specs.length} revisions`,
+    );
+  }
+  return lines.map((line) => {
+    const [sha, type] = line.split(/\s+/);
+    return type === 'tree' ? sha : null;
+  });
 }
 
 /**
