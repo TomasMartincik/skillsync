@@ -39,6 +39,7 @@ const DELIM_RE = /^---[ \t]*$/;
 
 /**
  * Parse a scalar token (quoted string, bool, null, number, or bare string).
+ * Fails closed on malformed quoting rather than silently mis-parsing.
  * @param {string} raw
  * @returns {unknown}
  */
@@ -47,10 +48,21 @@ function parseScalar(raw) {
   if (s === '') return '';
   const first = s[0];
   if (first === '"' || first === "'") {
-    const last = s[s.length - 1];
-    if (last === first && s.length >= 2) return s.slice(1, -1);
-    // Unterminated quote: treat literally, trimmed.
-    return s;
+    // Find the matching closing quote (no escapes in this subset), then allow an
+    // optional trailing ` # comment` after it. `version: "1.0" # release` must
+    // yield "1.0", not a literal including the quotes and comment.
+    const close = s.indexOf(first, 1);
+    if (close === -1) {
+      throw new SkillsyncError('BAD_FRONTMATTER', `unterminated quoted string: ${raw.trim()}`);
+    }
+    const after = s.slice(close + 1).trim();
+    if (after !== '' && !after.startsWith('#')) {
+      throw new SkillsyncError(
+        'BAD_FRONTMATTER',
+        `unexpected trailing content after quoted string: ${raw.trim()}`,
+      );
+    }
+    return s.slice(1, close);
   }
   // Strip a trailing inline comment for unquoted scalars: ` # ...`
   const cIdx = s.search(/\s#/);
@@ -66,6 +78,39 @@ function parseScalar(raw) {
 }
 
 /**
+ * Split a flow-sequence body on commas that are NOT inside quotes, so
+ * `[a, "b,c", d]` yields three items. Fails closed on unterminated quotes.
+ * @param {string} inner content between the brackets
+ * @returns {string[]}
+ */
+function splitFlowItems(inner) {
+  /** @type {string[]} */
+  const items = [];
+  let cur = '';
+  let quote = null;
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i];
+    if (quote) {
+      cur += ch;
+      if (ch === quote) quote = null;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+      cur += ch;
+    } else if (ch === ',') {
+      items.push(cur);
+      cur = '';
+    } else {
+      cur += ch;
+    }
+  }
+  if (quote) {
+    throw new SkillsyncError('BAD_FRONTMATTER', `unterminated quoted flow item: [${inner}]`);
+  }
+  items.push(cur);
+  return items;
+}
+
+/**
  * Parse an inline flow sequence `[a, b, c]`.
  * @param {string} raw includes surrounding brackets
  * @returns {unknown[]}
@@ -73,7 +118,7 @@ function parseScalar(raw) {
 function parseFlowSequence(raw) {
   const inner = raw.trim().slice(1, -1).trim();
   if (inner === '') return [];
-  return inner.split(',').map((part) => parseScalar(part));
+  return splitFlowItems(inner).map((part) => parseScalar(part));
 }
 
 /**
@@ -82,6 +127,9 @@ function parseFlowSequence(raw) {
  * @returns {{ block: string|null, body: string }}
  */
 function splitBlock(raw) {
+  // Strip a leading UTF-8 BOM so a file that begins with it still exposes its
+  // frontmatter (a BOM before `---` must not make the block disappear).
+  if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
   const lines = raw.split(/\r?\n/);
   if (lines.length === 0 || !DELIM_RE.test(lines[0])) {
     return { block: null, body: raw };
@@ -116,12 +164,21 @@ export function parseFrontmatter(raw) {
 
     const m = line.match(/^([A-Za-z0-9_-]+):[ \t]*(.*)$/);
     if (!m) {
-      // Not a recognized top-level key line (could be a stray block item at
-      // root or unsupported construct) — skip rather than throw, to be lenient.
-      continue;
+      // Fail closed: an unrecognized top-level line (stray block item at root,
+      // nested map, tab-indented key, or other unsupported construct) is an
+      // error rather than something to silently drop. A misleading partial parse
+      // is worse than an explicit rejection.
+      throw new SkillsyncError(
+        'BAD_FRONTMATTER',
+        `unsupported frontmatter line: ${JSON.stringify(line)}`,
+      );
     }
     const key = m[1];
     const rest = m[2];
+
+    if (Object.prototype.hasOwnProperty.call(data, key)) {
+      throw new SkillsyncError('BAD_FRONTMATTER', `duplicate frontmatter key: ${key}`);
+    }
 
     if (rest === '') {
       // Possible block sequence following on subsequent indented `- ` lines.

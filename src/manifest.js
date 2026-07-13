@@ -28,6 +28,7 @@
 
 import { promises as fs } from 'node:fs';
 import { AGENTS, MANIFEST_VERSION, MODES } from './constants.js';
+import { isValidSkillName } from './skill-name.js';
 import { SkillsyncError } from './util.js';
 
 /**
@@ -93,6 +94,12 @@ export function validateManifest(obj) {
   /** @type {Record<string, SkillPin>} */
   const skills = {};
   for (const [name, rawPin] of Object.entries(/** @type {Record<string, unknown>} */ (m.skills))) {
+    if (!isValidSkillName(name)) {
+      throw new SkillsyncError(
+        'BAD_MANIFEST',
+        `skill key ${JSON.stringify(name)} is not a valid skill name (Agent Skills grammar)`,
+      );
+    }
     skills[name] = validatePin(name, rawPin);
   }
   return { version: MANIFEST_VERSION, source: m.source, mode: m.mode, skills };
@@ -134,10 +141,26 @@ function validatePin(name, rawPin) {
   /** @type {SkillPin} */
   const pin = { version: p.version, commit: p.commit, sourceHash: p.sourceHash, outputs };
   if (p.agents !== undefined) {
-    if (!Array.isArray(p.agents) || !p.agents.every((a) => AGENTS.includes(/** @type {any} */ (a)))) {
+    if (
+      !Array.isArray(p.agents) ||
+      p.agents.length === 0 ||
+      !p.agents.every((a) => AGENTS.includes(/** @type {any} */ (a))) ||
+      new Set(p.agents).size !== p.agents.length
+    ) {
       throw new SkillsyncError('BAD_MANIFEST', `skill "${name}" agents filter is invalid`);
     }
     pin.agents = [...p.agents];
+  }
+  // Outputs must be exactly one hash per selected agent — no more, no fewer. A
+  // hand-edited pin with agents:["codex"] but outputs:{} (or an extra agent) is
+  // invalid state and is rejected here rather than failing mysteriously later.
+  const expected = pinAgents(pin);
+  const got = Object.keys(outputs);
+  if (got.length !== expected.length || !expected.every((a) => outputs[a] !== undefined)) {
+    throw new SkillsyncError(
+      'BAD_MANIFEST',
+      `skill "${name}" outputs must have exactly one hash per selected agent (expected: ${expected.join(', ')})`,
+    );
   }
   return pin;
 }

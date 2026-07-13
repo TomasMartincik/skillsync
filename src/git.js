@@ -20,6 +20,37 @@ import { SkillsyncError } from './util.js';
  */
 
 /**
+ * Repository-directing environment variables that, if inherited from a parent
+ * Git-driven process (e.g. skillsync invoked from a git hook), would silently
+ * redirect our clones/fetches at the wrong repository. We scrub them from every
+ * child. Authentication-related variables (GIT_SSH*, GIT_ASKPASS, credential
+ * helpers, SSH_AUTH_SOCK, …) are deliberately preserved so private-repo access
+ * keeps working.
+ * @type {string[]}
+ */
+const SCRUBBED_GIT_ENV = [
+  'GIT_DIR',
+  'GIT_WORK_TREE',
+  'GIT_INDEX_FILE',
+  'GIT_OBJECT_DIRECTORY',
+  'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+  'GIT_COMMON_DIR',
+  'GIT_NAMESPACE',
+  'GIT_CEILING_DIRECTORIES',
+  'GIT_PREFIX',
+];
+
+/**
+ * @param {NodeJS.ProcessEnv} base
+ * @returns {NodeJS.ProcessEnv}
+ */
+function scrubbedEnv(base) {
+  const env = { ...base };
+  for (const key of SCRUBBED_GIT_ENV) delete env[key];
+  return env;
+}
+
+/**
  * Run a git command. Never throws on non-zero by default; inspect `.code`.
  * @param {string[]} args
  * @param {{ cwd?: string, env?: NodeJS.ProcessEnv, input?: string }} [opts]
@@ -29,7 +60,7 @@ export function git(args, opts = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn('git', args, {
       cwd: opts.cwd,
-      env: opts.env ?? process.env,
+      env: scrubbedEnv(opts.env ?? process.env),
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let stdout = '';

@@ -104,22 +104,72 @@ export async function scanSkillTree(root) {
 }
 
 /**
- * Reject trees whose paths collide under Unicode NFC + case folding. Such a tree
- * would materialize as two files on Linux but one (clobbered) on macOS.
- * @param {SkillFile[]} files
+ * Case/Unicode-folding policy for collision detection.
+ *
+ * A tree that is two distinct entries on a case-sensitive filesystem (Linux) but
+ * one entry on a case-insensitive one (default macOS/Windows) would materialize
+ * differently per machine, breaking reproducibility and enabling one file to
+ * silently clobber another. We reject such trees.
+ *
+ * The policy is explicitly defined (not bare `toLowerCase()` on whole paths):
+ * fold = Unicode NFC normalization, then `toLocaleLowerCase('en-US')` for a
+ * locale-independent full-case fold, applied PER PATH COMPONENT. Collisions are
+ * checked at every component (directories included), and a name used once as a
+ * file and once as a directory prefix is a collision too.
+ *
+ * @param {string} s a single path component
+ * @returns {string}
+ */
+export function foldComponent(s) {
+  return s.normalize('NFC').toLocaleLowerCase('en-US');
+}
+
+/**
+ * Reject trees whose paths collide under the folding policy. Tracks every path
+ * COMPONENT (directories as well as files) and rejects:
+ *   - two distinct real components that fold to the same key (case/Unicode alias);
+ *   - a component used as both a leaf file and a directory prefix (file/dir clash).
+ * @param {Pick<SkillFile, 'rel'>[]} files
  */
 export function detectFoldCollisions(files) {
-  /** @type {Map<string, string>} */
+  // foldedPath -> { real: original-cased path, kind: 'dir'|'file' }
+  /** @type {Map<string, { real: string, kind: 'dir'|'file' }>} */
   const seen = new Map();
-  for (const f of files) {
-    const key = f.rel.normalize('NFC').toLowerCase();
-    const prev = seen.get(key);
-    if (prev !== undefined && prev !== f.rel) {
+
+  /**
+   * @param {string} foldedPath
+   * @param {string} realPath
+   * @param {'dir'|'file'} kind
+   */
+  function record(foldedPath, realPath, kind) {
+    const prev = seen.get(foldedPath);
+    if (prev === undefined) {
+      seen.set(foldedPath, { real: realPath, kind });
+      return;
+    }
+    if (prev.real !== realPath) {
       throw new SkillsyncError(
         'FOLD_COLLISION',
-        `case/Unicode-fold path collision: "${prev}" vs "${f.rel}"`,
+        `case/Unicode-fold path collision: "${prev.real}" vs "${realPath}"`,
       );
     }
-    seen.set(key, f.rel);
+    if (prev.kind !== kind) {
+      throw new SkillsyncError(
+        'FOLD_COLLISION',
+        `path used as both a file and a directory: "${realPath}"`,
+      );
+    }
+  }
+
+  for (const f of files) {
+    const parts = f.rel.split('/');
+    const foldedParts = [];
+    const realParts = [];
+    for (let i = 0; i < parts.length; i++) {
+      foldedParts.push(foldComponent(parts[i]));
+      realParts.push(parts[i]);
+      const isLeaf = i === parts.length - 1;
+      record(foldedParts.join('/'), realParts.join('/'), isLeaf ? 'file' : 'dir');
+    }
   }
 }
