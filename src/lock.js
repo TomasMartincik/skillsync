@@ -145,21 +145,30 @@ function isStaleMeta(meta) {
   if (meta.host !== os.hostname()) return false; // cross-host: cannot probe; never steal
   const pid = meta.pid;
   if (!Number.isInteger(pid) || pid <= 0) return false;
-  if (pid === process.pid) return false; // our own lock is not stale
-  let alive;
+  const recorded = typeof meta.start === 'string' && meta.start ? meta.start : null;
+
+  // START IDENTITY FIRST — including when the recorded pid is OUR OWN (round-3
+  // review MAJOR: a `pid === process.pid` short-circuit declared "not stale"
+  // before comparing start times, so a crashed holder's lock whose pid THIS
+  // process happens to inherit could never be reclaimed and every acquisition
+  // timed out forever). A lock is "live" only when pid AND start identity match.
+  if (pid === process.pid) {
+    const mine = procStartTime(process.pid);
+    if (recorded && mine) return recorded !== mine; // reused pid => stale; same start => genuinely ours
+    return false; // identity unverifiable — never steal (see README: `ps` requirement)
+  }
+
   try {
     process.kill(pid, 0); // signal 0 only tests existence
-    alive = true;
   } catch (err) {
     if (err && err.code === 'ESRCH') return true; // no such process => stale
     return false; // EPERM etc.: exists but not ours to probe — treat as held
   }
-  if (!alive) return true;
   // The pid exists. If we recorded a process start time and can read the current
   // one, a MISMATCH means the pid was reused by an unrelated process => stale.
-  if (typeof meta.start === 'string' && meta.start) {
+  if (recorded) {
     const now = procStartTime(pid);
-    if (now && now !== meta.start) return true;
+    if (now && now !== recorded) return true;
   }
   return false; // genuinely alive (or unverifiable) => held
 }
