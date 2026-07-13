@@ -37,6 +37,18 @@ import { SkillsyncError } from './util.js';
  * @returns {Promise<SkillFile[]>} files sorted ascending by POSIX relative path
  */
 export async function scanSkillTree(root) {
+  // Inspect the ROOT itself with a non-following lstat FIRST. A genuinely absent
+  // root propagates ENOENT (callers read that as "missing"); a symlinked or
+  // non-directory root is an anomaly, never silently followed/reported ok
+  // (MAJOR: the root was never lstat'd, so a symlinked skill dir read as ok).
+  const rootSt = await fs.lstat(root); // ENOENT propagates verbatim = missing
+  if (rootSt.isSymbolicLink()) {
+    throw new SkillsyncError('SYMLINK_REJECTED', `skill tree root is a symlink: ${root}`);
+  }
+  if (!rootSt.isDirectory()) {
+    throw new SkillsyncError('NON_REGULAR_REJECTED', `skill tree root is not a directory: ${root}`);
+  }
+
   /** @type {SkillFile[]} */
   const files = [];
   let total = 0;
@@ -97,7 +109,18 @@ export async function scanSkillTree(root) {
     }
   }
 
-  await walk(root, '');
+  try {
+    await walk(root, '');
+  } catch (err) {
+    // The root existed at lstat time, so an ENOENT DURING the walk is a concurrent
+    // deletion of a child (a race/anomaly), never proof the whole target is
+    // absent. Reclassify it so callers do not misread it as "missing" (MAJOR: a
+    // transient child ENOENT was treated as whole-target absence).
+    if (err && err.code === 'ENOENT') {
+      throw new SkillsyncError('SCAN_RACE', `skill tree changed during scan: ${root}`);
+    }
+    throw err;
+  }
   files.sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
   detectFoldCollisions(files);
   return files;

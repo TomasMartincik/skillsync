@@ -19,6 +19,7 @@
  * @module commands/sync
  */
 
+import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { readManifest, pinAgents } from '../manifest.js';
 import { preflight } from '../git.js';
@@ -130,12 +131,19 @@ export async function sync(argv, ctx) {
  */
 async function materializedStatus(projectDir, agent, skill, recorded) {
   const dir = path.join(projectDir, targetDir(agent, skill));
-  let actual;
+  // `missing` ONLY when a non-following lstat proves the root itself is absent.
+  // Any other outcome — a symlinked root, a mid-scan race, an unreadable file —
+  // is an anomaly, never a silent overwrite (MAJOR: anomalies read as missing).
   try {
-    actual = await hashMaterialized(dir);
+    await fs.lstat(dir);
   } catch (err) {
     if (err && err.code === 'ENOENT') return 'missing';
     return 'anomaly';
   }
-  return actual === recorded ? 'ok' : 'drifted';
+  try {
+    const actual = await hashMaterialized(dir);
+    return actual === recorded ? 'ok' : 'drifted';
+  } catch {
+    return 'anomaly';
+  }
 }

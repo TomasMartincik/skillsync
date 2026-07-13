@@ -1,25 +1,27 @@
 /**
  * Project-scoped exclusive lock (adversarial-review CRITICAL: unsafe acquisition
- * and incomplete coverage).
+ * and incomplete coverage; MINOR: temp-dir leak, EPERM misclassification; MAJOR:
+ * PID reuse strands the lock).
  *
  * Acquisition is race-free by ATOMIC PUBLISH: we build a fully-populated temp
- * directory containing a `meta.json` (random ownership token + pid + host), then
- * `rename()` it onto the lock path. `rename` onto an already-populated directory
- * fails, so exactly one contender can ever win, and the lock is NEVER visible in
- * a half-created state — closing the "pid file not yet written ⇒ looks stale"
- * race of the previous `mkdir`-then-`writeFile` design.
+ * directory containing a `meta.json` (random ownership token + pid + host +
+ * process start identity), then `rename()` it onto the lock path. `rename` onto an
+ * already-populated directory fails, so exactly one contender can ever win, and
+ * the lock is NEVER visible half-created.
  *
- * Acquisition BLOCKS (polls) until the lock is free or a timeout elapses, so two
- * concurrent commands queue and both complete instead of one failing. A lock is
- * reclaimed only when its recorded pid is provably dead ON THE SAME HOST; reclaim
- * itself is race-safe (rename-aside, single winner). Release removes the lock
- * only if the on-disk token still matches ours, so a process that was wrongly
- * deemed stale can never delete a lock another process now owns.
+ * Acquisition BLOCKS (polls) until the lock is free or a timeout elapses. A lock
+ * is reclaimed only when its recorded holder is provably gone ON THE SAME HOST:
+ * either the pid no longer exists, or the pid exists but its process START TIME
+ * differs from the recorded one (the pid was reused by an unrelated process). When
+ * liveness cannot be verified and the lock is older than a conservative age, the
+ * timeout error explains the manual-recovery path rather than stealing it.
  *
  * @module lock
  */
 
 import { promises as fs } from 'node:fs';
+import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -28,6 +30,8 @@ import { SkillsyncError } from './util.js';
 
 const DEFAULT_TIMEOUT_MS = envInt('SKILLSYNC_LOCK_TIMEOUT_MS', 30_000);
 const POLL_MS = envInt('SKILLSYNC_LOCK_POLL_MS', 40);
+/** A lock older than this whose holder liveness cannot be verified is reported as suspected-stale. */
+const MAX_AGE_MS = envInt('SKILLSYNC_LOCK_MAX_AGE_MS', 3_600_000);
 
 /**
  * @typedef {Object} Lock
@@ -37,8 +41,7 @@ const POLL_MS = envInt('SKILLSYNC_LOCK_POLL_MS', 40);
 
 /**
  * Acquire the project lock, waiting up to the timeout for a concurrent holder to
- * release. Throws LOCKED only if the timeout elapses while a *live* process holds
- * it.
+ * release.
  * @param {string} projectDir
  * @param {{ timeoutMs?: number }} [opts]
  * @returns {Promise<Lock>}
@@ -48,31 +51,37 @@ export async function acquireLock(projectDir, opts = {}) {
   const dir = path.join(projectDir, LOCK_DIR);
   const metaFile = path.join(dir, 'meta.json');
   const token = randomBytes(16).toString('hex');
-  const meta = { token, pid: process.pid, host: os.hostname(), time: Date.now() };
+  const meta = {
+    token,
+    pid: process.pid,
+    host: os.hostname(),
+    time: Date.now(),
+    start: procStartTime(process.pid),
+  };
 
   await fs.mkdir(path.dirname(dir), { recursive: true }); // ensure `.agents/` exists
+  await sweepLockTempOrphans(path.dirname(dir)); // clean crashed temp/stale dirs
   const deadline = Date.now() + timeoutMs;
 
   for (;;) {
     const tmp = `${dir}.tmp-${process.pid}-${randomBytes(6).toString('hex')}`;
-    await fs.mkdir(tmp, { recursive: true });
-    await fs.writeFile(path.join(tmp, 'meta.json'), JSON.stringify(meta), 'utf8');
+    // Exclusive create: never reuse a colliding directory.
+    await fs.mkdir(tmp);
     try {
+      await fs.writeFile(path.join(tmp, 'meta.json'), JSON.stringify(meta), 'utf8');
       await fs.rename(tmp, dir); // atomic; fails if `dir` already populated
       return makeLock(dir, metaFile, token);
     } catch (err) {
       await fs.rm(tmp, { recursive: true, force: true });
-      if (!isExistsError(err)) throw err;
+      // Real permission failures must surface immediately, not masquerade as a
+      // held lock and burn the whole timeout (MINOR: EPERM misclassified).
+      if (err && err.code === 'EPERM') throw err;
+      if (!isCollisionError(err)) throw err;
     }
 
-    // Held by someone else. Reclaim if provably dead, otherwise wait.
+    // Held by someone else. Reclaim if provably gone, otherwise wait.
     if (await tryReclaimIfStale(dir, metaFile)) continue;
-    if (Date.now() >= deadline) {
-      throw new SkillsyncError(
-        'LOCKED',
-        'another skillsync operation is in progress in this project (timed out waiting for the lock)',
-      );
-    }
+    if (Date.now() >= deadline) throw lockedError(metaFile);
     await sleep(POLL_MS);
   }
 }
@@ -90,8 +99,6 @@ function makeLock(dir, metaFile, token) {
     async release() {
       if (released) return;
       released = true;
-      // Remove the lock only if it is still OURS. If we were wrongly reclaimed as
-      // stale and another process now holds it, its token differs and we leave it.
       try {
         const meta = JSON.parse(await fs.readFile(metaFile, 'utf8'));
         if (meta && meta.token === token) {
@@ -105,9 +112,7 @@ function makeLock(dir, metaFile, token) {
 }
 
 /**
- * Reclaim the lock if its recorded holder is provably dead on this host. The
- * reclaim is race-safe: we rename the stale lock aside (atomic, single winner)
- * then delete it, so concurrent reclaimers do not stomp each other.
+ * Reclaim the lock if its recorded holder is provably gone on this host.
  * @param {string} dir
  * @param {string} metaFile
  * @returns {Promise<boolean>} true if reclaimed (caller should retry immediately)
@@ -117,10 +122,7 @@ async function tryReclaimIfStale(dir, metaFile) {
   try {
     meta = JSON.parse(await fs.readFile(metaFile, 'utf8'));
   } catch {
-    // Missing/corrupt meta. Atomic publish means this should not happen for a
-    // live lock; fail closed (wait) rather than steal a lock we cannot reason
-    // about — the acquire timeout still bounds the wait.
-    return false;
+    return false; // missing/corrupt meta for a live lock should not happen; wait.
   }
   if (!isStaleMeta(meta)) return false;
 
@@ -140,24 +142,127 @@ async function tryReclaimIfStale(dir, metaFile) {
  */
 function isStaleMeta(meta) {
   if (!meta || typeof meta !== 'object') return false;
-  if (meta.host !== os.hostname()) return false; // cross-host: cannot probe pid; never steal
+  if (meta.host !== os.hostname()) return false; // cross-host: cannot probe; never steal
   const pid = meta.pid;
   if (!Number.isInteger(pid) || pid <= 0) return false;
   if (pid === process.pid) return false; // our own lock is not stale
+  let alive;
   try {
     process.kill(pid, 0); // signal 0 only tests existence
-    return false; // process alive => held, not stale
+    alive = true;
   } catch (err) {
-    return Boolean(err && err.code === 'ESRCH'); // no such process => stale
+    if (err && err.code === 'ESRCH') return true; // no such process => stale
+    return false; // EPERM etc.: exists but not ours to probe — treat as held
+  }
+  if (!alive) return true;
+  // The pid exists. If we recorded a process start time and can read the current
+  // one, a MISMATCH means the pid was reused by an unrelated process => stale.
+  if (typeof meta.start === 'string' && meta.start) {
+    const now = procStartTime(pid);
+    if (now && now !== meta.start) return true;
+  }
+  return false; // genuinely alive (or unverifiable) => held
+}
+
+/**
+ * Best-effort process start identity, used to detect PID reuse. Linux: field 22
+ * of /proc/<pid>/stat (jiffies since boot). macOS/BSD: `ps -o lstart`. Returns
+ * null when unavailable — callers then fall back to the age-based message.
+ * @param {number} pid
+ * @returns {string|null}
+ */
+export function procStartTime(pid) {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const rparen = stat.lastIndexOf(')');
+    if (rparen !== -1) {
+      const fields = stat.slice(rparen + 2).trim().split(/\s+/);
+      // After ')' the next field is `state` (field 3); starttime is field 22.
+      const starttime = fields[19];
+      if (starttime) return `l:${starttime}`;
+    }
+  } catch {
+    // not Linux, or no /proc — fall through
+  }
+  try {
+    const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    return out ? `p:${out}` : null;
+  } catch {
+    return null;
   }
 }
 
 /**
+ * Build the acquire-timeout error. If the holder's liveness could not be verified
+ * and the lock is old, point at manual recovery instead of an opaque timeout.
+ * @param {string} metaFile
+ * @returns {SkillsyncError}
+ */
+function lockedError(metaFile) {
+  let meta = null;
+  try {
+    meta = JSON.parse(readFileSync(metaFile, 'utf8'));
+  } catch {
+    // fall through with generic message
+  }
+  const dir = path.dirname(metaFile);
+  if (
+    meta &&
+    typeof meta.time === 'number' &&
+    Date.now() - meta.time > MAX_AGE_MS &&
+    (!meta.start || !procStartTime(meta.pid))
+  ) {
+    return new SkillsyncError(
+      'LOCK_STALE_SUSPECTED',
+      `the project lock has been held since ${new Date(meta.time).toISOString()} by pid ${meta.pid} on ` +
+        `${meta.host}, and its liveness cannot be verified on this machine. If no skillsync operation is ` +
+        `actually running, remove the lock directory manually: rm -rf ${JSON.stringify(dir)}`,
+    );
+  }
+  return new SkillsyncError(
+    'LOCKED',
+    'another skillsync operation is in progress in this project (timed out waiting for the lock)',
+  );
+}
+
+/**
+ * Remove crashed lock temp/stale directories left under `.agents/` by a process
+ * that died between `mkdir` and `rename` (MINOR: temp-dir leak). Conservative:
+ * only sweeps `.skillsync.lock.tmp-*` / `.skillsync.lock.stale-*` older than a
+ * few seconds, so a live acquirer's in-flight temp dir is never removed.
+ * @param {string} agentsDir
+ */
+async function sweepLockTempOrphans(agentsDir) {
+  const base = path.basename(LOCK_DIR);
+  let entries;
+  try {
+    entries = await fs.readdir(agentsDir);
+  } catch {
+    return;
+  }
+  const now = Date.now();
+  for (const name of entries) {
+    if (!name.startsWith(`${base}.tmp-`) && !name.startsWith(`${base}.stale-`)) continue;
+    const abs = path.join(agentsDir, name);
+    try {
+      const st = await fs.lstat(abs);
+      if (now - st.mtimeMs > 5_000) await fs.rm(abs, { recursive: true, force: true });
+    } catch {
+      // gone already / racing another sweeper — ignore
+    }
+  }
+}
+
+/**
+ * A `rename`-onto-populated-directory collision (someone else holds the lock).
  * @param {any} err
  * @returns {boolean}
  */
-function isExistsError(err) {
-  return Boolean(err && (err.code === 'EEXIST' || err.code === 'ENOTEMPTY' || err.code === 'EPERM'));
+function isCollisionError(err) {
+  return Boolean(err && (err.code === 'EEXIST' || err.code === 'ENOTEMPTY'));
 }
 
 /** @param {number} ms */

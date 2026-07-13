@@ -9,7 +9,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { MANIFEST_PATH } from '../constants.js';
 import { acquireLock } from '../lock.js';
-import { recover } from '../materialize.js';
+import { recover, assertContainerSafe } from '../materialize.js';
 
 /**
  * @typedef {Object} Project
@@ -34,6 +34,9 @@ export function resolveProject(cwd) {
  * @returns {Promise<T>}
  */
 export async function withLock(projectDir, fn) {
+  // Confine BEFORE taking the lock: a symlinked `.agents` must never be followed
+  // by lock acquisition or recovery (CRITICAL: escape through `.agents`).
+  await assertContainerSafe(projectDir);
   const lock = await acquireLock(projectDir);
   try {
     await recover(projectDir);

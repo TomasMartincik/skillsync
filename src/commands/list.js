@@ -4,6 +4,7 @@
  * @module commands/list
  */
 
+import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { readManifest, pinAgents } from '../manifest.js';
 import { hashMaterialized } from '../materialize.js';
@@ -53,11 +54,19 @@ export async function list(argv, ctx) {
  */
 async function statusFor(projectDir, agent, skill, recorded) {
   const dir = path.join(projectDir, targetDir(agent, skill));
+  // `missing` ONLY when a non-following lstat proves the root itself is absent;
+  // any other failure (symlinked root, mid-scan race, unreadable file) is an
+  // anomaly (MAJOR: anomalies were reported as missing).
+  try {
+    await fs.lstat(dir);
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return 'missing';
+    return 'anomaly';
+  }
   try {
     const actual = await hashMaterialized(dir);
     return actual === recorded ? 'ok' : 'drifted';
-  } catch (err) {
-    if (err && err.code === 'ENOENT') return 'missing';
+  } catch {
     return 'anomaly';
   }
 }
