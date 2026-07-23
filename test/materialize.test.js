@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { runTransaction } from '../src/materialize.js';
+import { applyChanges } from '../src/materialize.js';
 import { scanSkillTree } from '../src/input-policy.js';
 import { writeSkill, tmpDir, rmrf } from './helpers.js';
 
@@ -38,7 +38,7 @@ async function pathExists(p) {
   }
 }
 
-test('runTransaction materializes targets, writes manifest last, cleans up staging', async () => {
+test('applyChanges materializes targets, writes manifest last, cleans up staging', async () => {
   const root = await tmpDir();
   try {
     const proj = path.join(root, 'proj');
@@ -46,7 +46,7 @@ test('runTransaction materializes targets, writes manifest last, cleans up stagi
     const src = path.join(root, 'src', 'g');
     await writeSkill(src, { name: 'g', version: '1.0', files: { 'r/n.md': 'hi' } });
 
-    await runTransaction(proj, await onePlan(src));
+    await applyChanges(proj, await onePlan(src));
 
     assert.ok((await fs.stat(path.join(proj, '.claude/skills/g/SKILL.md'))).isFile());
     assert.ok((await fs.stat(path.join(proj, '.agents/skills/g/r/n.md'))).isFile());
@@ -71,7 +71,7 @@ test('the manifest is written LAST — a crash before it leaves the OLD (absent)
 
     // Throw exactly at the manifest phase: dirs are installed, manifest not yet.
     await assert.rejects(
-      runTransaction(proj, await onePlan(src), (phase) => {
+      applyChanges(proj, await onePlan(src), (phase) => {
         if (phase === 'manifest') throw new Error('crash before manifest');
       }),
       /crash before manifest/,
@@ -80,7 +80,7 @@ test('the manifest is written LAST — a crash before it leaves the OLD (absent)
     await assert.rejects(fs.stat(path.join(proj, '.agents/skills-manifest.json')), 'manifest not written yet');
 
     // Re-running the same operation converges and writes the manifest.
-    await runTransaction(proj, await onePlan(src));
+    await applyChanges(proj, await onePlan(src));
     assert.ok((await fs.stat(path.join(proj, '.agents/skills-manifest.json'))).isFile());
   } finally {
     await rmrf(root);
@@ -101,7 +101,7 @@ test('the install replaces a COMPLETE tree via a single rename (atomic visibilit
 
     let absentBeforeRename = false;
     let completeAtRename = false;
-    await runTransaction(proj, await onePlan(src), async (phase) => {
+    await applyChanges(proj, await onePlan(src), async (phase) => {
       if (phase === 'swap.0.pre-rename') {
         // The old dir has been removed; the target is momentarily absent — it is
         // NEVER observed as a partially-populated mix of old and new.
@@ -136,7 +136,7 @@ test('install replaces an existing dir (old content gone)', async () => {
 
     const src = path.join(root, 'src', 'g');
     await writeSkill(src, { name: 'g', version: '1.0' });
-    await runTransaction(proj, await onePlan(src));
+    await applyChanges(proj, await onePlan(src));
 
     await assert.rejects(fs.stat(path.join(proj, '.claude/skills/g/OLD.md'))); // replaced
     assert.ok((await fs.stat(path.join(proj, '.claude/skills/g/SKILL.md'))).isFile());
@@ -157,7 +157,7 @@ test('a symlinked target ancestor is refused (no escape out of the project)', as
     const src = path.join(root, 'src', 'g');
     await writeSkill(src, { name: 'g', version: '1.0', body: 'NEW' });
 
-    await assert.rejects(runTransaction(proj, await onePlan(src)), (err) => err.code === 'UNSAFE_ANCESTOR');
+    await assert.rejects(applyChanges(proj, await onePlan(src)), (err) => err.code === 'UNSAFE_ANCESTOR');
     await assert.rejects(fs.stat(path.join(outside, 'skills/g/SKILL.md')), 'nothing written through the symlink');
   } finally {
     await rmrf(root);

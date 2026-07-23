@@ -14,7 +14,7 @@ import { MANIFEST_PATH, MODES } from '../constants.js';
 import { emptyManifest } from '../manifest.js';
 import { preflight, repoState } from '../git.js';
 import { getDefaultSource, setDefaultSource, normalizeSource } from '../config.js';
-import { runTransaction } from '../materialize.js';
+import { applyChanges } from '../materialize.js';
 import { excludeEntriesFor } from '../plan.js';
 import { SkillsyncError, log, warn } from '../util.js';
 import { resolveProject, withLock, parseArgs, confirm, pathExists } from './common.js';
@@ -65,7 +65,7 @@ export async function init(argv, ctx) {
     const { warnings } = await preflight(ctx.cwd, { mode, manifestPath: project.manifestPath });
     for (const w of warnings) warn(w);
 
-    await runTransaction(ctx.cwd, {
+    await applyChanges(ctx.cwd, {
       manifest,
       targets: [],
       removeDirs: [],

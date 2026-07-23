@@ -2,7 +2,7 @@
  * Idempotent materialization.
  *
  * skillsync copies Markdown skill folders into a project. Crash-safety comes from
- * IDEMPOTENCE, not a transaction log:
+ * IDEMPOTENCE:
  *
  *   1. STAGE   — generate each target's artifact into a private staging dir under
  *                `.agents/`, then SCAN + VALIDATE + HASH the STAGED tree (not the
@@ -11,15 +11,14 @@
  *   2. INSTALL — for each target, atomically `rename` the staged dir into place
  *                (replacing any existing copy), so an agent never observes a
  *                half-written skill; then apply removals.
- *   3. MANIFEST— write the manifest LAST via write-temp + atomic rename. Because it
- *                lands last and atomically, the manifest ALWAYS describes the last
- *                fully-completed state.
+ *   3. MANIFEST— write the manifest LAST via write-temp + fsync + atomic rename.
+ *                Because it lands last and atomically, the manifest ALWAYS describes
+ *                the last fully-completed state.
  *
- * There is no journal, no backup, and no recovery state machine. Recovery IS
- * re-running: a crash mid-operation leaves at most (a) stale staging dirs, swept on
- * the next lock acquisition, and (b) copies whose on-disk hash does not match the
- * manifest, which the next `sync`/`add` re-materializes. This assumes a non-hostile
- * local user (see README).
+ * Recovery IS re-running: a crash mid-operation leaves at most (a) stale staging
+ * dirs, swept on the next lock acquisition, and (b) copies whose on-disk hash does
+ * not match the manifest, which the next `sync`/`add` re-materializes. This assumes
+ * a non-hostile local user (see README).
  *
  * @module materialize
  */
@@ -28,7 +27,7 @@ import { promises as fs } from 'node:fs';
 import { createReadStream, createWriteStream } from 'node:fs';
 import path from 'node:path';
 import { AGENT_TARGETS, MANIFEST_PATH, STAGE_PREFIX } from './constants.js';
-import { fsyncDir, fsyncHandle, fsyncParent } from './durable.js';
+import { fsyncHandle } from './durable.js';
 import { writeExclude } from './exclude.js';
 import { hashFiles } from './hash.js';
 import { SkillsyncError } from './util.js';
@@ -101,16 +100,12 @@ export async function stageTargets(projectDir, targetSpecs, onPhase) {
     for (const f of spec.files) {
       await copyFile(f.abs, path.join(stagedAbs, f.rel), f.exec);
     }
-    // Light durability: fsync the staged target root so a crash after the manifest
-    // is written cannot leave the renamed-in tree's top-level entries unflushed.
-    await fsyncDir(stagedAbs);
     maybeCrash(`stage.${i}.copied`);
     // Authoritative: hash the STAGED tree we just wrote, not the source checkout.
     const staged = await scanSkillTree(stagedAbs);
     const hash = await hashFiles(staged);
     targets.push({ target: spec.target, stagedRel: `${stageRel}/${stagedName}`, hash });
   }
-  await fsyncDir(stageDir);
 
   return { uid, stageRel, targets };
 }
@@ -155,7 +150,6 @@ export async function commitStaged(projectDir, plan, onPhase) {
     }
     await phase(onPhase, `swap.${i}.pre-rename`);
     await fs.rename(stagedAbs, targetAbs);
-    await fsyncParent(targetAbs);
     await phase(onPhase, `swap.${i}.post-rename`);
   }
 
@@ -167,7 +161,6 @@ export async function commitStaged(projectDir, plan, onPhase) {
     const targetAbs = abs(rel);
     if (await exists(targetAbs)) {
       await fs.rm(targetAbs, { recursive: true, force: true });
-      await fsyncParent(targetAbs);
     }
     await phase(onPhase, `removal.${i}.post`);
   }
@@ -195,7 +188,7 @@ export async function commitStaged(projectDir, plan, onPhase) {
  * @param {(phase: string) => void|Promise<void>} [onPhase]
  * @returns {Promise<void>}
  */
-export async function runTransaction(projectDir, plan, onPhase) {
+export async function applyChanges(projectDir, plan, onPhase) {
   const staged = await stageTargets(projectDir, plan.targets, onPhase);
   await commitStaged(
     projectDir,
@@ -347,10 +340,7 @@ async function assertNoSymlinkAncestors(projectDir, rel) {
 
 /**
  * Create `relDir` beneath the project, verifying with a non-following lstat that no
- * existing component is a symlink. Every directory we CREATE here is a live ancestor
- * of a materialized skill (`.claude`, `.claude/skills`, `.agents`, …), so its parent
- * is fsynced right after the mkdir — a crash must not keep the (durable) manifest
- * while losing the directory entry it depends on.
+ * existing component is a symlink.
  * @param {string} projectDir
  * @param {string} relDir POSIX project-relative directory
  */
@@ -367,7 +357,6 @@ async function ensureDirNoSymlink(projectDir, relDir) {
     } catch (err) {
       if (err && err.code === 'ENOENT') {
         await fs.mkdir(cur);
-        await fsyncParent(cur);
         continue;
       }
       throw err;
@@ -390,9 +379,8 @@ async function ensureDirNoSymlink(projectDir, relDir) {
 
 /**
  * Copy one file into staging using file descriptors: open the source, fstat it to
- * confirm it is a regular file at open time, stream the bytes, normalize the mode
- * class, and fsync before close. A regular-file fsync error is fatal (EIO/ENOSPC
- * must never be swallowed).
+ * confirm it is a regular file at open time, stream the bytes, and normalize the
+ * mode class.
  * @param {string} srcAbs
  * @param {string} destAbs
  * @param {boolean} exec
@@ -417,17 +405,12 @@ async function copyFile(srcAbs, destAbs, exec) {
     rs.pipe(ws);
   });
   await fs.chmod(destAbs, exec ? 0o755 : 0o644);
-  const dfh = await fs.open(destAbs, 'r');
-  try {
-    await fsyncHandle(dfh, destAbs);
-  } finally {
-    await dfh.close();
-  }
 }
 
 /**
- * Atomically write a file: temp in the same dir, fsync, rename over the target,
- * then fsync the directory.
+ * Atomically write a file: temp in the same dir, fsync the bytes, then rename over
+ * the target. This one fsync (the manifest) keeps "manifest = completed state"
+ * honest across a power loss.
  * @param {string} filePath
  * @param {string} content
  */
@@ -436,12 +419,11 @@ async function atomicWrite(filePath, content) {
   const fh = await fs.open(tmp, 'w');
   try {
     await fh.writeFile(content, 'utf8');
-    await fsyncHandle(fh, tmp);
+    await fsyncHandle(fh);
   } finally {
     await fh.close();
   }
   await fs.rename(tmp, filePath);
-  await fsyncDir(path.dirname(filePath));
 }
 
 /**

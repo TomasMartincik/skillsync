@@ -6,7 +6,7 @@
 
 import { readManifest, pinAgents } from '../manifest.js';
 import { preflight } from '../git.js';
-import { runTransaction } from '../materialize.js';
+import { applyChanges } from '../materialize.js';
 import { excludeEntriesFor, targetDir } from '../plan.js';
 import { assertSkillName } from '../skill-name.js';
 import { SkillsyncError, log, warn } from '../util.js';
@@ -48,7 +48,7 @@ export async function remove(argv, ctx) {
 
     if (removeDirs.length === 0) return;
 
-    await runTransaction(ctx.cwd, {
+    await applyChanges(ctx.cwd, {
       manifest,
       targets: [],
       removeDirs,

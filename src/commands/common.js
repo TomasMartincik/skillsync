@@ -27,8 +27,8 @@ export function resolveProject(cwd) {
 
 /**
  * Run `fn` while holding the project lock, sweeping any orphaned staging left by a
- * crashed run first. There is no journal to replay — recovery is simply re-running
- * the command, which re-materializes anything whose hash does not match the manifest.
+ * crashed run first. Recovery is simply re-running the command, which
+ * re-materializes anything whose hash does not match the manifest.
  * @template T
  * @param {string} projectDir
  * @param {() => Promise<T>} fn
