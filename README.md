@@ -11,8 +11,9 @@ folders) from one central git repo into many projects, as real copies, for **Cla
   skills repo through your machine's own git/`gh` credentials; the repo URL lives in each
   project's manifest.
 
-This is the **core** (Wayfinder ticket #12). The adaptation layer, update machinery, hooks, and
-`install.sh` are separate tickets (#13–#15); this repo leaves clean seams for them.
+This is the **core** (Wayfinder ticket #12) plus the **update/versioning layer** (#13:
+`update`/`status` and the version cache). The adaptation layer, hooks, and `install.sh` are
+separate tickets (#14–#15); this repo leaves clean seams for them.
 
 ## Install
 
@@ -35,13 +36,34 @@ Requires Node ≥ 18 and git.
 | `remove <skill>…` | Disable skills: drop their pins and delete their materialized copies. |
 | `sync [--force]` | Materialize **exactly** what the manifest pins (version-exact; the cached commit is not authoritative). Never advances pins. Skips a drifted or anomalous copy with a warning; `--force` overwrites it. |
 | `list` | Show pinned skills and each copy's status (`ok` / `missing` / `drifted` / `anomaly`). Read-only; no network. |
+| `update [skill…] [--major] [--to <major.minor>] [--preview] [--force]` | Advance pins toward central's latest published version. Bare `update` applies every pending **minor** (same major) and **lists** pending majors; `--major` applies majors too; `--to` sets an exact version (both directions); `--preview` shows the changes without touching files; `--force` overwrites a drifted/anomalous copy. |
+| `status [--cached]` | Per skill: recorded version, central's latest with its update class, and the local copy's drift/anomaly state. `--cached` reports from the version cache with **zero network** (and shows its age). |
 | `suggest <skill>\|--new <name> [--file <path> \| -m "…"]` | File a **text-only** change request as a `suggest/<skill>-<slug>-<id>` branch on central. No diff machinery; the request is prose (from `--file`, `-m`, or stdin). Never force-pushed. |
 
-`init`, `add`, `remove`, `sync` take a project-scoped exclusive lock and run their entire
-`read manifest → plan → install` sequence **under** it (so two concurrent commands
+`init`, `add`, `remove`, `sync`, `update` take a project-scoped exclusive lock and run their
+entire `read manifest → plan → install` sequence **under** it (so two concurrent commands
 queue and compose rather than clobbering each other). `add` clones central, records its HEAD
-commit and each skill's current published version, then pins it. `list` and `suggest` do not
-mutate project skill trees.
+commit and each skill's current published version, then pins it. `list`, `status`, `suggest`,
+and `update --preview` do not mutate project skill trees.
+
+### Update & status semantics
+
+Update detection is **version-only** (per skill's `version: <major>.<minor>` frontmatter, compared
+against the manifest's recorded version) — the content hash is never consulted for update
+detection, only for drift. A **minor** bump is auto-applicable; a **major** is a migration you opt
+into. `update` reuses the same materialization path as `add` (it is add-with-a-different-pin, not a
+separate pipeline): `--major`/minor apply central's latest; `--to <version>` scans central's
+first-parent history for the exact declared version and materializes it either direction (the
+explicit version is itself the consent). A skill in the manifest but absent from central's HEAD is
+reported as **deleted centrally** (a status string; no tombstone machinery), and `status` also warns
+if the same skill name exists in `$HOME/.agents/skills` (Codex reads that scope alongside the
+project's without dedup).
+
+Any command that already fetches central (`add`, `update`, `status`) refreshes a per-machine
+**version cache** as a free side effect — a single JSON file beside the global config
+(`$XDG_CONFIG_HOME/skillsync/version-cache.json`), keyed by normalized source URL, written
+atomically (temp + rename). `status --cached` reads it with zero network cost and reports its age
+(`checked 3h ago`).
 
 ## Manifest schema (v1)
 

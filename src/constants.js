@@ -58,6 +58,9 @@ export const MAX_SKILL_FILES = 2000;
 /** Per-machine config dir (honors XDG_CONFIG_HOME). */
 export const CONFIG_SUBPATH = 'skillsync/config.json';
 
+/** Per-machine version cache (honors XDG_CONFIG_HOME), beside the config. */
+export const CACHE_SUBPATH = 'skillsync/version-cache.json';
+
 /** Marker block used to manage skillsync entries inside `.git/info/exclude`. */
 export const EXCLUDE_BEGIN = '# >>> skillsync managed (do not edit) >>>';
 export const EXCLUDE_END = '# <<< skillsync managed <<<';

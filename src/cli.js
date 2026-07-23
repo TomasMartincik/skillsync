@@ -8,10 +8,12 @@ import { add } from './commands/add.js';
 import { remove } from './commands/remove.js';
 import { sync } from './commands/sync.js';
 import { list } from './commands/list.js';
+import { update } from './commands/update.js';
+import { status } from './commands/status.js';
 import { suggest } from './commands/suggest.js';
 import { SkillsyncError } from './util.js';
 
-const VERBS = /** @type {const} */ ({ init, add, remove, sync, list, suggest });
+const VERBS = /** @type {const} */ ({ init, add, remove, sync, list, update, status, suggest });
 
 const HELP = `skillsync — distribute Agent Skills from a central git repo into projects
 
@@ -34,6 +36,15 @@ commands:
 
   list
       Show pinned skills and their materialization status.
+
+  update [skill…] [--major] [--to <major.minor>] [--preview] [--force]
+      Advance pins to central's latest. Bare update applies pending minors and
+      lists pending majors; --major applies majors; --to sets an exact version
+      (both directions); --preview shows changes without touching files.
+
+  status [--cached]
+      Per skill: recorded version, central latest + update class, copy state.
+      --cached reports from the version cache with zero network (and its age).
 
   suggest <skill>|--new <name> [--file <path> | -m "…"]
       File a text-only change request as a suggest/* branch on central.

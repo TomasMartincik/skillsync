@@ -267,6 +267,54 @@ export async function readSkillVersion(skillDir) {
 }
 
 /**
+ * The central "latest" declared version of a skill: the version in its SKILL.md at
+ * the clone's HEAD, which (HEAD being the newest first-parent commit) is the newest
+ * first-parent declaration. Returns null if the skill is absent from central HEAD —
+ * i.e. deleted centrally.
+ * @param {string} dir a full clone (checked out at HEAD)
+ * @param {string} skill
+ * @returns {Promise<string|null>}
+ */
+export async function centralVersion(dir, skill) {
+  let rel;
+  try {
+    rel = await findSkillRel(dir, skill);
+  } catch (err) {
+    if (err instanceof SkillsyncError && err.code === 'SKILL_NOT_FOUND') return null;
+    throw err;
+  }
+  return readSkillVersion(path.join(dir, rel));
+}
+
+/**
+ * Compare two canonical `major.minor` version strings.
+ * @param {string} a
+ * @param {string} b
+ * @returns {-1|0|1}
+ */
+export function compareVersions(a, b) {
+  const [am, an] = a.split('.').map((x) => BigInt(x));
+  const [bm, bn] = b.split('.').map((x) => BigInt(x));
+  if (am !== bm) return am < bm ? -1 : 1;
+  if (an !== bn) return an < bn ? -1 : 1;
+  return 0;
+}
+
+/**
+ * Classify a manifest-recorded version against central's latest.
+ * @param {string} recorded manifest pin version
+ * @param {string|null} central central latest (null => deleted centrally)
+ * @returns {'current'|'minor'|'major'|'deleted'}
+ */
+export function classifyVersion(recorded, central) {
+  if (central === null) return 'deleted';
+  if (compareVersions(central, recorded) <= 0) return 'current';
+  const centralMajor = BigInt(central.split('.')[0]);
+  const recordedMajor = BigInt(recorded.split('.')[0]);
+  return centralMajor > recordedMajor ? 'major' : 'minor';
+}
+
+/**
  * Normalize a frontmatter version value to a CANONICAL `major.minor` string, or
  * null. Leading zeros are stripped via BigInt so `01.02` and `1.2` canonicalize to
  * the same value (adversarial-review: leading-zero versions formed distinct

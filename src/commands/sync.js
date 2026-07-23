@@ -19,13 +19,12 @@
  * @module commands/sync
  */
 
-import { promises as fs } from 'node:fs';
-import path from 'node:path';
 import { readManifest, pinAgents } from '../manifest.js';
 import { preflight } from '../git.js';
 import { hashSkillTree } from '../hash.js';
 import { adaptForAgent } from '../adapt.js';
-import { stageTargets, commitStaged, hashMaterialized } from '../materialize.js';
+import { stageTargets, commitStaged } from '../materialize.js';
+import { materializedStatus } from '../materialized-status.js';
 import { PinResolver } from '../pin-resolver.js';
 import { excludeEntriesFor, targetDir } from '../plan.js';
 import { SkillsyncError, log, warn } from '../util.js';
@@ -116,34 +115,4 @@ export async function sync(argv, ctx) {
       await resolver.cleanup();
     }
   });
-}
-
-/**
- * Classify a materialized copy. Only a genuinely absent target is `missing`;
- * every other failure (integrity/scan/hash error) is an `anomaly` that requires
- * `--force`, never a silent overwrite (adversarial-review MAJOR: anomalies were
- * misclassified as missing).
- * @param {string} projectDir
- * @param {string} agent
- * @param {string} skill
- * @param {string} recorded recorded output hash
- * @returns {Promise<'ok'|'missing'|'drifted'|'anomaly'>}
- */
-async function materializedStatus(projectDir, agent, skill, recorded) {
-  const dir = path.join(projectDir, targetDir(agent, skill));
-  // `missing` ONLY when a non-following lstat proves the root itself is absent.
-  // Any other outcome — a symlinked root, a mid-scan race, an unreadable file —
-  // is an anomaly, never a silent overwrite (MAJOR: anomalies read as missing).
-  try {
-    await fs.lstat(dir);
-  } catch (err) {
-    if (err && err.code === 'ENOENT') return 'missing';
-    return 'anomaly';
-  }
-  try {
-    const actual = await hashMaterialized(dir);
-    return actual === recorded ? 'ok' : 'drifted';
-  } catch {
-    return 'anomaly';
-  }
 }

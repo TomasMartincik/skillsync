@@ -21,8 +21,9 @@ import { fullClone, findSkillRel } from '../fetch.js';
 import { buildSkillPlan } from '../skill-pin.js';
 import { stageTargets, commitStaged } from '../materialize.js';
 import { excludeEntriesFor, targetDir } from '../plan.js';
+import { refreshCacheEntry } from '../version-cache.js';
 import { assertSkillName } from '../skill-name.js';
-import { SkillsyncError, log } from '../util.js';
+import { SkillsyncError, log, warn } from '../util.js';
 import { resolveProject, withLock, parseArgs } from './common.js';
 
 /**
@@ -91,6 +92,17 @@ export async function add(argv, ctx) {
         removeDirs,
         excludeEntries: excludeEntriesFor(manifest),
       });
+
+      // Cache side effect: `add` pins central's HEAD, so the recorded versions ARE
+      // central's latest. Best-effort — a cache write must never fail the command.
+      try {
+        /** @type {Record<string,string>} */
+        const observed = {};
+        for (const [skill, pin] of newPins) observed[skill] = pin.version;
+        await refreshCacheEntry(manifest.source, observed);
+      } catch (err) {
+        warn(`could not refresh version cache: ${(err && err.message) || err}`);
+      }
     } finally {
       await checkout.cleanup();
     }
