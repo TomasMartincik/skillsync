@@ -11,20 +11,54 @@ folders) from one central git repo into many projects, as real copies, for **Cla
   skills repo through your machine's own git/`gh` credentials; the repo URL lives in each
   project's manifest.
 
-This is the **core** (Wayfinder ticket #12). The adaptation layer, update machinery, hooks, and
-`install.sh` are separate tickets (#13–#15); this repo leaves clean seams for them.
+This is the **core** (Wayfinder ticket #12). The adaptation layer and update machinery are separate
+tickets; this repo leaves clean seams for them.
 
 ## Install
 
-An installer (`curl | bash` → `~/.local/share/skillsync`) ships in a later ticket (#15). For now,
-clone this repo and run the entry point directly:
+One line (macOS/Linux; Windows via WSL). Requires Node ≥ 18 and git:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/TomasMartincik/skillsync/main/install.sh | bash
+```
+
+The installer is idempotent. It clones the tool into `~/.local/share/skillsync`, symlinks
+`bin/skillsync.js` onto `~/.local/bin/skillsync`, prints PATH advice if `~/.local/bin` isn't on your
+`PATH`, and finishes by installing the machine-global session-start hooks (see below). Set
+`SKILLSYNC_NO_HOOKS=1` to skip the hook step. Re-running it fast-forwards the clone and repairs the
+symlink.
+
+Prefer to run without installing? Clone this repo and invoke the entry point directly:
 
 ```sh
 node /path/to/skillsync/bin/skillsync.js <command>
-# or symlink it onto your PATH as `skillsync`
 ```
 
-Requires Node ≥ 18 and git.
+## Session-start hooks
+
+`skillsync hooks install` merges one **SessionStart** hook into each agent's user-level config
+(`~/.claude/settings.json` for Claude Code, `~/.codex/hooks.json` for Codex), idempotently and
+without disturbing any unrelated hooks. `install.sh` runs it as its last step. The hook runs a small
+guard (`bin/skillsync-notice.js`) that:
+
+- exits silently unless the current directory (or an ancestor) has a `.agents/skills-manifest.json`
+  **and** skillsync is installed;
+- otherwise runs `skillsync status --cached` (2s timeout, **fail-open** — any error is silent) and,
+  **only when updates are pending**, emits one advisory notice: plain stdout for Claude Code, the
+  documented `{"systemMessage": "…"}` JSON for Codex. When a major bump is pending it appends a
+  migration warning (major updates are migrations — analyze the impact before `update <skill>
+  --major`). It never mutates anything.
+
+**Codex caveat:** writing the file is *not* activation. Codex requires you to trust a new or changed
+hook once via `/hooks` before it fires. `skillsync hooks doctor` reports, per agent, whether the
+entry and guard script are present, and states this "pending review" honestly for Codex.
+
+## Self-update
+
+`skillsync self-update` updates the install clone. It is **not** a blind pull (ADR 0003 amendment):
+it fetches, shows the incoming commit log and diff stat (`--diff` for the full diff), and requires
+explicit confirmation (`y/N`; `--yes` skips the prompt) before a **fast-forward-only** merge. It then
+re-runs `hooks install` to repair the hook entries in case the guard script changed.
 
 ## Commands
 
@@ -36,6 +70,8 @@ Requires Node ≥ 18 and git.
 | `sync [--force]` | Materialize **exactly** what the manifest pins (version-exact; the cached commit is not authoritative). Never advances pins. Skips a drifted or anomalous copy with a warning; `--force` overwrites it. |
 | `list` | Show pinned skills and each copy's status (`ok` / `missing` / `drifted` / `anomaly`). Read-only; no network. |
 | `suggest <skill>\|--new <name> [--file <path> \| -m "…"]` | File a **text-only** change request as a `suggest/<skill>-<slug>-<id>` branch on central. No diff machinery; the request is prose (from `--file`, `-m`, or stdin). Never force-pushed. |
+| `hooks install` / `hooks doctor` | Idempotently install the machine-global SessionStart notice hook into both agents' user configs / report its state. See [Session-start hooks](#session-start-hooks). |
+| `self-update [--yes] [--diff]` | Update the install clone: fetch, show the incoming commits + diff stat, confirm, fast-forward, and re-run `hooks install`. See [Self-update](#self-update). |
 
 `init`, `add`, `remove`, `sync` take a project-scoped exclusive lock and run their entire
 `read manifest → plan → install` sequence **under** it (so two concurrent commands
