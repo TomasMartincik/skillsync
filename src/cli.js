@@ -11,9 +11,22 @@ import { list } from './commands/list.js';
 import { update } from './commands/update.js';
 import { status } from './commands/status.js';
 import { suggest } from './commands/suggest.js';
+import { hooks } from './commands/hooks.js';
+import { selfUpdate } from './commands/self-update.js';
 import { SkillsyncError } from './util.js';
 
-const VERBS = /** @type {const} */ ({ init, add, remove, sync, list, update, status, suggest });
+const VERBS = /** @type {const} */ ({
+  init,
+  add,
+  remove,
+  sync,
+  list,
+  update,
+  status,
+  suggest,
+  hooks,
+  'self-update': selfUpdate,
+});
 
 const HELP = `skillsync — distribute Agent Skills from a central git repo into projects
 
@@ -48,6 +61,19 @@ commands:
 
   suggest <skill>|--new <name> [--file <path> | -m "…"]
       File a text-only change request as a suggest/* branch on central.
+
+  hooks install
+      Idempotently install the machine-global SessionStart hook into
+      ~/.claude/settings.json and ~/.codex/hooks.json. In Codex the hook is
+      pending review until trusted via /hooks.
+
+  hooks doctor
+      Report per agent whether the hook entry and guard script are present.
+
+  self-update
+      Update the install clone: fetch, show the incoming commits + diff stat
+      (--diff for the full diff), confirm (y/N; --yes skips), fast-forward, and
+      re-run hooks install. Never a blind pull.
 
 Global: this tool has zero npm dependencies and no build step.`;
 
