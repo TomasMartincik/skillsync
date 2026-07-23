@@ -21,56 +21,22 @@ async function withIsolatedConfig(root, fn) {
 }
 
 /**
- * Adversarial-review MAJOR: a version reused across a real content change (same
- * version number, different skill tree) must be rejected — otherwise an old
- * project pinning content A and a new project pinning content B share a version.
+ * Version resolution returns the newest first-parent commit that declares the
+ * pinned version.
  */
-test('resolveVersionToCommit rejects a duplicate version at a content boundary', async () => {
+test('resolveVersionToCommit finds the newest first-parent declaration of a version', async () => {
   const root = await tmpDir();
   try {
     const central = await makeCentral(path.join(root, 'central'), [
-      { message: 'v1.2 A', skill: { name: 'foo', version: '1.2', body: 'CONTENT-A' } },
-      { message: 'v1.2 B (forgot to bump)', skill: { name: 'foo', version: '1.2', body: 'CONTENT-B' } },
+      { message: 'v1.0', skill: { name: 'foo', version: '1.0', body: 'ONE' } },
+      { message: 'v1.1', skill: { name: 'foo', version: '1.1', body: 'TWO' } },
     ]);
+    const [c10, c11] = central.commits;
     const clone = await fullClone(central.dir);
     try {
-      await assert.rejects(resolveVersionToCommit(clone.dir, 'foo', '1.2'), (err) => err.code === 'DUPLICATE_VERSION');
-    } finally {
-      await clone.cleanup();
-    }
-  } finally {
-    await rmrf(root);
-  }
-});
-
-/**
- * Adversarial-review MAJOR: history broke when a skill directory moved — the path
- * was found once at HEAD and applied to every ancestor, so pre-move releases
- * vanished. The skill dir is now located PER first-parent boundary.
- */
-test('publication history survives a skill directory move (old/foo -> new/foo)', async () => {
-  const root = await tmpDir();
-  try {
-    const central = path.join(root, 'central');
-    await fs.mkdir(path.join(central, 'old'), { recursive: true });
-    gitSync(central, ['init', '-q', '-b', 'main']);
-    await writeSkill(path.join(central, 'old', 'foo'), { name: 'foo', version: '1.0', body: 'A' });
-    gitSync(central, ['add', '-A']);
-    gitSync(central, ['commit', '-q', '-m', 'v1.0 at old/foo']);
-    const c10 = gitSync(central, ['rev-parse', 'HEAD']);
-
-    // Move old/foo -> new/foo AND bump to 1.1 in the same commit.
-    await fs.rm(path.join(central, 'old', 'foo'), { recursive: true, force: true });
-    await writeSkill(path.join(central, 'new', 'foo'), { name: 'foo', version: '1.1', body: 'B' });
-    gitSync(central, ['add', '-A']);
-    gitSync(central, ['commit', '-q', '-m', 'move to new/foo @1.1']);
-    const c11 = gitSync(central, ['rev-parse', 'HEAD']);
-
-    const clone = await fullClone(central);
-    try {
-      // Both the pre-move (old path) and post-move (new path) releases resolve.
       assert.equal(await resolveVersionToCommit(clone.dir, 'foo', '1.0'), c10);
       assert.equal(await resolveVersionToCommit(clone.dir, 'foo', '1.1'), c11);
+      await assert.rejects(resolveVersionToCommit(clone.dir, 'foo', '9.9'), (err) => err.code === 'UNRESOLVABLE_PIN');
     } finally {
       await clone.cleanup();
     }
@@ -79,28 +45,10 @@ test('publication history survives a skill directory move (old/foo -> new/foo)',
   }
 });
 
-test('add validates publication history and rejects a duplicate version', async () => {
-  const root = await tmpDir();
-  try {
-    await withIsolatedConfig(root, async () => {
-      const central = await makeCentral(path.join(root, 'central'), [
-        { message: 'v1.2 A', skill: { name: 'foo', version: '1.2', body: 'CONTENT-A' } },
-        { message: 'v1.2 B', skill: { name: 'foo', version: '1.2', body: 'CONTENT-B' } },
-      ]);
-      const proj = path.join(root, 'proj');
-      await fs.mkdir(proj, { recursive: true });
-      await init(['--source', central.dir, '--mode', 'plain'], { cwd: proj });
-      await assert.rejects(add(['foo'], { cwd: proj }), (err) => err.code === 'DUPLICATE_VERSION');
-    });
-  } finally {
-    await rmrf(root);
-  }
-});
-
 /**
- * Adversarial-review MAJOR: the recorded commit is only a cache. If it declares a
- * DIFFERENT version than the pin (a stale/wrong but still-reachable commit), sync
- * must resolve the pinned version from history instead of failing.
+ * The recorded commit is only a cache. If it declares a DIFFERENT version than the
+ * pin (a stale/wrong but still-reachable commit), sync must resolve the pinned
+ * version from history instead of failing.
  */
 test('version resolution overrides a wrong-but-reachable cached commit', async () => {
   const root = await tmpDir();

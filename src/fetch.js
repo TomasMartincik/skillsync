@@ -6,16 +6,13 @@
  * git/gh credentials; no persistent per-machine clone of the skills repo exists.
  *
  * Pin retrieval protocol (`ensureCommit`):
- *   1. fast path  — `git fetch --depth 1 origin <commit>` (direct SHA fetch);
- *   2. deepen     — shallow-fetch the default branch, then `--deepen` in steps
- *                   until the object appears;
- *   3. full       — unshallow / full fetch of all branches.
+ *   1. fast path — `git fetch --depth 1 origin <commit>` (direct SHA fetch);
+ *   2. full      — unshallow / full fetch of all branches.
  *   If the object is still absent, throw UNRESOLVABLE_PIN *before* any project
  *   file is touched.
  *
  * Version pins resolve to commits via `resolveVersionToCommit`, which walks
- * first-parent history (adversarial-review MAJOR-2) and rejects regressed
- * versions.
+ * first-parent history for the newest commit declaring the pinned version.
  *
  * @module fetch
  */
@@ -120,15 +117,8 @@ async function ensureCommit(dir, commit) {
   const direct = await git(['fetch', '--depth', '1', 'origin', commit], { cwd: dir });
   if (direct.code === 0 && (await hasCommit(dir, commit))) return;
 
-  // 2. deepen — grab the default branch shallow, then deepen in steps.
-  await git(['fetch', '--depth', '1', 'origin'], { cwd: dir });
-  if (await hasCommit(dir, commit)) return;
-  for (const depth of [10, 50, 250, 1000]) {
-    await git(['fetch', `--deepen=${depth}`, 'origin'], { cwd: dir });
-    if (await hasCommit(dir, commit)) return;
-  }
-
-  // 3. full — unshallow / fetch everything.
+  // 2. full — unshallow / fetch every branch. (`--unshallow` is a no-op error on a
+  // repo that never became shallow; the branch fetch below covers that case.)
   await git(['fetch', '--unshallow', 'origin'], { cwd: dir });
   await git(['fetch', 'origin', '+refs/heads/*:refs/remotes/origin/*'], { cwd: dir });
   if (await hasCommit(dir, commit)) return;
@@ -167,167 +157,33 @@ export async function fullClone(source) {
 }
 
 /**
- * @typedef {Object} Publication
- * @property {string} skillRel POSIX rel path to the skill dir at HEAD (or the
- *   newest boundary where it existed)
- * @property {{ commit: string, version: string, tree: string, rel: string }[]} observed
- *   first-parent tree-change boundaries newest -> oldest, one entry per boundary
- *   where the skill exists; `tree` is the git tree object id of the skill dir
- *   (content identity); `rel` is the skill dir path AT that boundary.
- */
-
-/**
- * Scan a skill's first-parent publication history and enforce the central-repo
- * invariants (adversarial-review MAJOR: duplicate versions / no `add` validation;
- * history broke when a skill directory moved):
- *   - versions are monotonically non-decreasing over time (no regression);
- *   - each version maps to exactly ONE canonical skill tree — a version reused
- *     across a real content change (the skill tree object id differs) is rejected.
- *
- * The skill directory is located PER BOUNDARY, not once at HEAD, so a rename such
- * as `old/foo` -> `new/foo` keeps every historical release visible. Boundaries are
- * the first-parent commits that changed ANYTHING in the skill's directory — not
- * just its `SKILL.md` (round-3 review MAJOR: a commit touching only
- * `scripts/helper.js` was not a boundary, so two DIFFERENT whole-skill trees could
- * be published under one version and the duplicate-version invariant it is the
- * whole point of this scan to enforce was defeated).
- * @param {string} dir a full clone
- * @param {string} skill skill name
- * @returns {Promise<Publication>}
- */
-export async function scanPublication(dir, skill) {
-  assertSkillName(skill);
-  // First-parent boundaries where ANY file under a directory named `<skill>` (at
-  // any depth, including the repo root) changed. Both pathspecs are passed for
-  // portability across git's glob handling of a leading `**/`.
-  const boundaries = (
-    await gitOrThrow(
-      [
-        'log',
-        '--first-parent',
-        '--format=%H',
-        '--',
-        `:(glob)**/${skill}/**`,
-        `:(glob)${skill}/**`,
-      ],
-      { cwd: dir },
-    )
-  )
-    .split('\n')
-    .filter(Boolean);
-
-  // Locate the skill dir at each boundary (one ls-tree per boundary), then resolve
-  // every boundary's tree id in ONE batched `cat-file` call — this runs under the
-  // project lock, so the git call count must stay bounded, not grow 3x per commit.
-  /** @type {{ commit: string, rel: string }[]} */
-  const located = [];
-  for (const commit of boundaries) {
-    const rel = await findSkillRelAt(dir, skill, commit); // path AT this boundary
-    if (rel === null) continue; // a deletion boundary
-    located.push({ commit, rel });
-  }
-  const trees = await batchTreeShas(dir, located.map((l) => `${l.commit}:${l.rel}`));
-
-  /** @type {Publication['observed']} */
-  const observed = [];
-  for (let i = 0; i < located.length; i++) {
-    const { commit, rel } = located[i];
-    const tree = trees[i];
-    if (!tree) continue; // not a tree at this boundary (defensive)
-    const v = await readSkillVersionAt(dir, commit, rel);
-    if (v === null) continue;
-    observed.push({ commit, version: v, tree, rel });
-  }
-
-  if (observed.length === 0) {
-    throw new SkillsyncError('SKILL_NOT_FOUND', `skill "${skill}" has no versioned history in source`);
-  }
-
-  // Monotonicity: newest -> oldest, versions must be non-increasing.
-  for (let i = 1; i < observed.length; i++) {
-    if (compareVersions(observed[i - 1].version, observed[i].version) < 0) {
-      throw new SkillsyncError(
-        'VERSION_REGRESSION',
-        `skill "${skill}" has a non-monotonic version history (${observed[i].version} precedes ${observed[i - 1].version}); central history must be unique and monotonic`,
-      );
-    }
-  }
-
-  // Uniqueness: a version must correspond to exactly one canonical tree.
-  /** @type {Map<string, string>} */
-  const versionTree = new Map();
-  for (const o of observed) {
-    const prev = versionTree.get(o.version);
-    if (prev !== undefined && prev !== o.tree) {
-      throw new SkillsyncError(
-        'DUPLICATE_VERSION',
-        `skill "${skill}" reuses version ${o.version} for two different skill trees; central must bump the version on every content change`,
-      );
-    }
-    if (prev === undefined) versionTree.set(o.version, o.tree);
-  }
-
-  return { skillRel: observed[0].rel, observed };
-}
-
-/**
- * Locate the uniquely-named skill directory (the one containing SKILL.md) within a
- * single commit's tree. Returns null if the skill is absent at that commit; throws
- * AMBIGUOUS_SKILL if two directories of that name both carry a SKILL.md.
- * @param {string} dir
- * @param {string} skill
- * @param {string} commit
- * @returns {Promise<string|null>} POSIX rel path of the skill dir at `commit`
- */
-async function findSkillRelAt(dir, skill, commit) {
-  const out = await gitOrThrow(['ls-tree', '-r', '--name-only', commit], { cwd: dir });
-  const suffix = `/${skill}/SKILL.md`;
-  const exact = `${skill}/SKILL.md`;
-  /** @type {Set<string>} */
-  const dirs = new Set();
-  for (const line of out.split('\n')) {
-    if (line === exact) dirs.add(skill);
-    else if (line.endsWith(suffix)) dirs.add(line.slice(0, -'/SKILL.md'.length));
-  }
-  if (dirs.size === 0) return null;
-  if (dirs.size > 1) {
-    throw new SkillsyncError(
-      'AMBIGUOUS_SKILL',
-      `skill "${skill}" appears at multiple paths in ${commit.slice(0, 8)} (${[...dirs].join(', ')}); central must keep one canonical location`,
-    );
-  }
-  return [...dirs][0];
-}
-
-/**
- * Validate a skill's publication history (used by `add`, which otherwise only
- * sees HEAD). Throws VERSION_REGRESSION / DUPLICATE_VERSION on a broken history.
- * @param {string} dir a full clone
- * @param {string} skill
- * @returns {Promise<void>}
- */
-export async function validatePublication(dir, skill) {
-  await scanPublication(dir, skill);
-}
-
-/**
- * Resolve a version pin to the newest first-parent commit whose skill declares
- * that version, after enforcing the publication invariants.
+ * Resolve a version pin to the newest first-parent commit whose `<skill>/SKILL.md`
+ * declares that version. The skill directory is located once (at HEAD of the clone);
+ * a skill that has since moved resolves only versions published at its current path,
+ * with a clear UNRESOLVABLE_PIN otherwise. `sync` is already protected by the
+ * commit + sourceHash pins, so a duplicate version is at worst a resolve error, not
+ * corruption.
  * @param {string} dir a full clone
  * @param {string} skill skill name
  * @param {string} version target version, e.g. "1.2"
  * @returns {Promise<string>} commit SHA
  */
 export async function resolveVersionToCommit(dir, skill, version) {
-  const { observed } = await scanPublication(dir, skill);
-  const match = observed.find((o) => o.version === version);
-  if (!match) {
-    throw new SkillsyncError(
-      'UNRESOLVABLE_PIN',
-      `no commit found declaring version ${version} for skill "${skill}"`,
-    );
+  assertSkillName(skill);
+  const skillRel = await findSkillRel(dir, skill);
+  const commits = (
+    await gitOrThrow(['log', '--first-parent', '--format=%H', '--', `${skillRel}/SKILL.md`], { cwd: dir })
+  )
+    .split('\n')
+    .filter(Boolean);
+  for (const commit of commits) {
+    // Commits are newest -> oldest; the first match is the newest declaration.
+    if ((await readSkillVersionAt(dir, commit, skillRel)) === version) return commit;
   }
-  return match.commit;
+  throw new SkillsyncError(
+    'UNRESOLVABLE_PIN',
+    `no commit found declaring version ${version} for skill "${skill}"`,
+  );
 }
 
 /**
@@ -341,34 +197,6 @@ async function readSkillVersionAt(dir, commit, skillRel) {
   if (r.code !== 0) return null;
   const { data } = parseFrontmatter(r.stdout);
   return normalizeVersion(data.version);
-}
-
-/**
- * Git tree object ids for a list of `<commit>:<skillRel>` revisions, resolved in a
- * SINGLE `git cat-file --batch-check` process (one git invocation for the whole
- * history scan instead of one per boundary). A tree id is the content-identity of
- * the whole skill directory: two commits with identical skill content share it.
- * @param {string} dir
- * @param {string[]} specs
- * @returns {Promise<(string|null)[]>} tree id per input, null when absent/not a tree
- */
-async function batchTreeShas(dir, specs) {
-  if (specs.length === 0) return [];
-  const r = await git(['cat-file', '--batch-check'], { cwd: dir, input: `${specs.join('\n')}\n` });
-  if (r.code !== 0) {
-    throw new SkillsyncError('GIT_FAILED', `git cat-file --batch-check failed (${r.code}): ${r.stderr.trim()}`);
-  }
-  const lines = r.stdout.split('\n').filter((l) => l !== '');
-  if (lines.length !== specs.length) {
-    throw new SkillsyncError(
-      'GIT_FAILED',
-      `git cat-file --batch-check returned ${lines.length} results for ${specs.length} revisions`,
-    );
-  }
-  return lines.map((line) => {
-    const [sha, type] = line.split(/\s+/);
-    return type === 'tree' ? sha : null;
-  });
 }
 
 /**
@@ -456,23 +284,6 @@ export function normalizeVersion(v) {
   }
   if (/^\d+$/.test(s)) return `${BigInt(s)}.0`;
   return null;
-}
-
-/**
- * Compare two `major.minor` versions numerically with BigInt (leading zeros and
- * arbitrarily large components compare correctly). Returns -1, 0, or 1.
- * @param {string} a
- * @param {string} b
- * @returns {number}
- */
-export function compareVersions(a, b) {
-  const [am, an] = a.split('.');
-  const [bm, bn] = b.split('.');
-  const major = BigInt(am) - BigInt(bm);
-  if (major !== 0n) return major < 0n ? -1 : 1;
-  const minor = BigInt(an) - BigInt(bn);
-  if (minor !== 0n) return minor < 0n ? -1 : 1;
-  return 0;
 }
 
 /**

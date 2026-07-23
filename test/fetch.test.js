@@ -9,27 +9,16 @@ import {
   findSkillRel,
   readSkillVersion,
   normalizeVersion,
-  compareVersions,
 } from '../src/fetch.js';
 import { makeCentral, tmpDir, rmrf } from './helpers.js';
 
-test('normalizeVersion / compareVersions', () => {
+test('normalizeVersion canonicalizes with BigInt', () => {
   assert.equal(normalizeVersion('1.2'), '1.2');
   assert.equal(normalizeVersion('3'), '3.0');
   assert.equal(normalizeVersion('bad'), null);
-  assert.ok(compareVersions('1.2', '1.10') < 0);
-  assert.ok(compareVersions('2.0', '1.9') > 0);
-  assert.equal(compareVersions('1.1', '1.1'), 0);
-});
-
-test('versions canonicalize leading zeros and compare with BigInt', () => {
-  // Leading zeros canonicalize to the same key (no distinct-but-equal versions).
+  // Leading zeros canonicalize to the same key; a wide minor is not truncated.
   assert.equal(normalizeVersion('01.02'), '1.2');
-  assert.equal(normalizeVersion('1.10'), '1.10'); // minor not truncated to 1.1
-  assert.equal(compareVersions('01.2', '1.2'), 0);
-  assert.ok(compareVersions('1.02', '1.10') < 0);
-  // Arbitrarily large components (beyond float precision) still compare correctly.
-  assert.ok(compareVersions('1.9999999999999999', '1.10000000000000000') < 0);
+  assert.equal(normalizeVersion('1.10'), '1.10');
 });
 
 test('cloneOperand recognizes scp shorthand with and without a username', () => {
@@ -76,24 +65,6 @@ test('resolveVersionToCommit maps version -> commit via first-parent history', a
       assert.equal(await resolveVersionToCommit(clone.dir, 'g', '1.1'), c11);
       assert.equal(await resolveVersionToCommit(clone.dir, 'g', '1.2'), c12);
       await assert.rejects(resolveVersionToCommit(clone.dir, 'g', '9.9'), /UNRESOLVABLE_PIN|no commit/);
-    } finally {
-      await clone.cleanup();
-    }
-  } finally {
-    await rmrf(root);
-  }
-});
-
-test('resolveVersionToCommit rejects a regressed (non-monotonic) history', async () => {
-  const root = await tmpDir();
-  try {
-    const central = await makeCentral(path.join(root, 'central'), [
-      { message: 'v1.1', skill: { name: 'g', version: '1.1', body: 'A' } },
-      { message: 'regress to 1.0', skill: { name: 'g', version: '1.0', body: 'B' } },
-    ]);
-    const clone = await fullClone(central.dir);
-    try {
-      await assert.rejects(resolveVersionToCommit(clone.dir, 'g', '1.0'), /VERSION_REGRESSION|monotonic/);
     } finally {
       await clone.cleanup();
     }

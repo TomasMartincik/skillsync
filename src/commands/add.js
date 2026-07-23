@@ -17,7 +17,7 @@ import path from 'node:path';
 import { AGENTS } from '../constants.js';
 import { readManifest, pinAgents } from '../manifest.js';
 import { preflight } from '../git.js';
-import { fullClone, findSkillRel, validatePublication } from '../fetch.js';
+import { fullClone, findSkillRel } from '../fetch.js';
 import { buildSkillPlan } from '../skill-pin.js';
 import { stageTargets, commitStaged } from '../materialize.js';
 import { excludeEntriesFor, targetDir } from '../plan.js';
@@ -43,8 +43,8 @@ export async function add(argv, ctx) {
     const { warnings } = await preflight(ctx.cwd, { mode: manifest.mode, manifestPath: project.manifestPath });
     for (const w of warnings) log(`warning: ${w}`);
 
-    // Full clone: we must validate each skill's publication history (uniqueness
-    // + monotonicity), which HEAD-only shallow clones cannot show.
+    // Full clone: `add` records central's HEAD commit and the skill's current
+    // published version; `sync` later reproduces exactly that pin.
     const checkout = await fullClone(manifest.source);
     try {
       /** @type {string[]} */
@@ -56,7 +56,6 @@ export async function add(argv, ctx) {
 
       for (const skill of positionals) {
         const rel = await findSkillRel(checkout.dir, skill);
-        await validatePublication(checkout.dir, skill);
         const skillDir = path.join(checkout.dir, rel);
         const { pin, specs } = await buildSkillPlan({
           skill,
