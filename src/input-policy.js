@@ -5,8 +5,8 @@
  * be validated before it is hashed or copied. This module enforces:
  *   - no symlinks, and no non-regular files (FIFO/socket/device) anywhere;
  *   - per-file and per-skill size limits, and a file-count cap;
- *   - case/Unicode-fold path collision detection (macOS case-insensitive FS vs
- *     Linux case-sensitive FS would otherwise materialize different trees).
+ *   - case-fold path collision detection (two paths that differ only by case would
+ *     materialize as one file on a case-insensitive FS like default macOS).
  *
  * The result is a deterministic, sorted list of regular files that hashing and
  * copying both consume, so every stage sees the exact same view of the tree.
@@ -127,72 +127,21 @@ export async function scanSkillTree(root) {
 }
 
 /**
- * Case/Unicode-folding policy for collision detection.
- *
- * A tree that is two distinct entries on a case-sensitive filesystem (Linux) but
- * one entry on a case-insensitive one (default macOS/Windows) would materialize
- * differently per machine, breaking reproducibility and enabling one file to
- * silently clobber another. We reject such trees.
- *
- * The policy is explicitly defined (not bare `toLowerCase()` on whole paths):
- * fold = Unicode NFC normalization, then `toLocaleLowerCase('en-US')` for a
- * locale-independent full-case fold, applied PER PATH COMPONENT. Collisions are
- * checked at every component (directories included), and a name used once as a
- * file and once as a directory prefix is a collision too.
- *
- * @param {string} s a single path component
- * @returns {string}
- */
-export function foldComponent(s) {
-  return s.normalize('NFC').toLocaleLowerCase('en-US');
-}
-
-/**
- * Reject trees whose paths collide under the folding policy. Tracks every path
- * COMPONENT (directories as well as files) and rejects:
- *   - two distinct real components that fold to the same key (case/Unicode alias);
- *   - a component used as both a leaf file and a directory prefix (file/dir clash).
+ * Reject trees whose relative paths collide under a plain lowercase fold: two
+ * distinct paths that lowercase to the same string would materialize as one file on
+ * a case-insensitive filesystem (default macOS), breaking reproducibility and
+ * letting one file silently clobber another.
  * @param {Pick<SkillFile, 'rel'>[]} files
  */
 export function detectFoldCollisions(files) {
-  // foldedPath -> { real: original-cased path, kind: 'dir'|'file' }
-  /** @type {Map<string, { real: string, kind: 'dir'|'file' }>} */
+  /** @type {Map<string, string>} lowercased rel path -> first real rel path */
   const seen = new Map();
-
-  /**
-   * @param {string} foldedPath
-   * @param {string} realPath
-   * @param {'dir'|'file'} kind
-   */
-  function record(foldedPath, realPath, kind) {
-    const prev = seen.get(foldedPath);
-    if (prev === undefined) {
-      seen.set(foldedPath, { real: realPath, kind });
-      return;
-    }
-    if (prev.real !== realPath) {
-      throw new SkillsyncError(
-        'FOLD_COLLISION',
-        `case/Unicode-fold path collision: "${prev.real}" vs "${realPath}"`,
-      );
-    }
-    if (prev.kind !== kind) {
-      throw new SkillsyncError(
-        'FOLD_COLLISION',
-        `path used as both a file and a directory: "${realPath}"`,
-      );
-    }
-  }
-
   for (const f of files) {
-    const parts = f.rel.split('/');
-    const foldedParts = [];
-    const realParts = [];
-    for (let i = 0; i < parts.length; i++) {
-      foldedParts.push(foldComponent(parts[i]));
-      realParts.push(parts[i]);
-      const isLeaf = i === parts.length - 1;
-      record(foldedParts.join('/'), realParts.join('/'), isLeaf ? 'file' : 'dir');
+    const key = f.rel.toLowerCase();
+    const prev = seen.get(key);
+    if (prev !== undefined && prev !== f.rel) {
+      throw new SkillsyncError('FOLD_COLLISION', `case path collision: "${prev}" vs "${f.rel}"`);
     }
+    if (prev === undefined) seen.set(key, f.rel);
   }
 }

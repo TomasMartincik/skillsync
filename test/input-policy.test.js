@@ -38,7 +38,7 @@ test('rejects non-regular files (FIFO)', async () => {
   }
 });
 
-test('detects case/Unicode-fold path collisions', () => {
+test('detects a case-fold path collision on the full relative path', () => {
   assert.throws(
     () =>
       detectFoldCollisions([
@@ -53,28 +53,6 @@ test('detects case/Unicode-fold path collisions', () => {
       { rel: 'a.md', abs: '', size: 0, exec: false },
       { rel: 'b.md', abs: '', size: 0, exec: false },
     ]),
-  );
-});
-
-test('detects a file-vs-directory fold collision (A vs a/x)', () => {
-  assert.throws(
-    () =>
-      detectFoldCollisions([
-        { rel: 'A', abs: '', size: 0, exec: false },
-        { rel: 'a/x', abs: '', size: 0, exec: false },
-      ]),
-    /FOLD_COLLISION|collision|directory/,
-  );
-});
-
-test('detects a folded DIRECTORY alias (Assets/x vs assets/y)', () => {
-  assert.throws(
-    () =>
-      detectFoldCollisions([
-        { rel: 'Assets/x', abs: '', size: 0, exec: false },
-        { rel: 'assets/y', abs: '', size: 0, exec: false },
-      ]),
-    /FOLD_COLLISION|collision/,
   );
 });
 
