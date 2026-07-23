@@ -98,7 +98,14 @@ export async function stageTargets(projectDir, targetSpecs, onPhase) {
     const stagedAbs = path.join(stageDir, stagedName);
     await fs.mkdir(stagedAbs, { recursive: true });
     for (const f of spec.files) {
-      await copyFile(f.abs, path.join(stagedAbs, f.rel), f.exec);
+      const dest = path.join(stagedAbs, f.rel);
+      // Adapter-synthesized files (modified SKILL.md, generated openai.yaml) carry
+      // their bytes inline; everything else streams from its source path.
+      if (typeof f.content === 'string') {
+        await writeStagedContent(dest, f.content, f.exec);
+      } else {
+        await copyFile(f.abs, dest, f.exec);
+      }
     }
     maybeCrash(`stage.${i}.copied`);
     // Authoritative: hash the STAGED tree we just wrote, not the source checkout.
@@ -404,6 +411,19 @@ async function copyFile(srcAbs, destAbs, exec) {
     ws.on('finish', resolve);
     rs.pipe(ws);
   });
+  await fs.chmod(destAbs, exec ? 0o755 : 0o644);
+}
+
+/**
+ * Write an adapter-generated file into staging. Unlike copyFile there is no source
+ * fd to stream from — the bytes come from the adaptation layer in memory.
+ * @param {string} destAbs
+ * @param {string} content
+ * @param {boolean} exec
+ */
+async function writeStagedContent(destAbs, content, exec) {
+  await fs.mkdir(path.dirname(destAbs), { recursive: true });
+  await fs.writeFile(destAbs, content, { mode: exec ? 0o755 : 0o644 });
   await fs.chmod(destAbs, exec ? 0o755 : 0o644);
 }
 

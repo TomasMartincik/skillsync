@@ -90,3 +90,54 @@ export function parseFrontmatter(raw) {
   }
   return { data, body };
 }
+
+/**
+ * Textually remove a set of TOP-LEVEL frontmatter keys from a raw SKILL.md and
+ * return the rewritten file. This is the WRITE counterpart to the lenient reader:
+ * rather than re-serialize the whole block (which would need a YAML writer and
+ * would reflow formatting), it deletes the matching `key:` line plus any indented
+ * continuation lines belonging to it (nested mappings, block scalars, sequence
+ * items) and leaves every other byte — including the body — untouched. A file with
+ * no frontmatter block, or an empty `keys`, is returned unchanged.
+ * @param {string} raw
+ * @param {Iterable<string>} keys top-level keys to remove
+ * @returns {string}
+ */
+export function stripFrontmatterKeys(raw, keys) {
+  const drop = new Set(keys);
+  if (drop.size === 0) return raw;
+
+  let bom = '';
+  let text = raw;
+  if (text.charCodeAt(0) === 0xfeff) {
+    bom = '﻿';
+    text = text.slice(1);
+  }
+  // Split on LF only (keeps any trailing \r attached to each line) so CRLF and LF
+  // files are both rebuilt byte-for-byte apart from the removed lines.
+  const lines = text.split('\n');
+  const isDelim = (s) => /^---[ \t]*\r?$/.test(s);
+  if (lines.length === 0 || !isDelim(lines[0])) return raw; // no frontmatter block
+
+  let close = -1;
+  for (let i = 1; i < lines.length; i++) {
+    if (isDelim(lines[i])) {
+      close = i;
+      break;
+    }
+  }
+  if (close === -1) return raw; // opening delimiter with no close — leave untouched
+
+  const out = [lines[0]]; // opening ---
+  for (let i = 1; i < close; i++) {
+    const m = lines[i].match(/^([A-Za-z0-9_-]+):/);
+    if (m && drop.has(m[1])) {
+      // Drop the key line and its indented continuation lines.
+      while (i + 1 < close && /^[ \t]/.test(lines[i + 1])) i++;
+      continue;
+    }
+    out.push(lines[i]);
+  }
+  for (let i = close; i < lines.length; i++) out.push(lines[i]); // closing --- + body
+  return bom + out.join('\n');
+}
