@@ -4,24 +4,22 @@
  * PID reuse strands the lock).
  *
  * Acquisition is race-free by ATOMIC PUBLISH: we build a fully-populated temp
- * directory containing a `meta.json` (random ownership token + pid + host +
- * process start identity), then `rename()` it onto the lock path. `rename` onto an
- * already-populated directory fails, so exactly one contender can ever win, and
- * the lock is NEVER visible half-created.
+ * directory containing a `meta.json` (random ownership token + pid + host), then
+ * `rename()` it onto the lock path. `rename` onto an already-populated directory
+ * fails, so exactly one contender can ever win, and the lock is NEVER visible
+ * half-created.
  *
- * Acquisition BLOCKS (polls) until the lock is free or a timeout elapses. A lock
- * is reclaimed only when its recorded holder is provably gone ON THE SAME HOST:
- * either the pid no longer exists, or the pid exists but its process START TIME
- * differs from the recorded one (the pid was reused by an unrelated process). When
- * liveness cannot be verified and the lock is older than a conservative age, the
- * timeout error explains the manual-recovery path rather than stealing it.
+ * Acquisition BLOCKS (polls) until the lock is free or a timeout elapses. A lock is
+ * reclaimed only when its recorded holder is provably gone ON THE SAME HOST: the pid
+ * no longer exists (`kill(pid, 0)` reports ESRCH). When liveness cannot be verified
+ * and the lock is older than a conservative age, the timeout error explains the
+ * manual-recovery path rather than stealing it.
  *
  * @module lock
  */
 
 import { promises as fs } from 'node:fs';
 import { readFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -56,7 +54,6 @@ export async function acquireLock(projectDir, opts = {}) {
     pid: process.pid,
     host: os.hostname(),
     time: Date.now(),
-    start: procStartTime(process.pid),
   };
 
   await fs.mkdir(path.dirname(dir), { recursive: true }); // ensure `.agents/` exists
@@ -137,6 +134,10 @@ async function tryReclaimIfStale(dir, metaFile) {
 }
 
 /**
+ * A lock is stale only when its recorded holder is provably gone on THIS host: the
+ * pid no longer exists (`kill(pid, 0)` reports ESRCH). A pid that exists — including
+ * a reused one — is treated as held; the acquire timeout and its manual-removal
+ * message cover that case.
  * @param {any} meta
  * @returns {boolean}
  */
@@ -145,68 +146,18 @@ function isStaleMeta(meta) {
   if (meta.host !== os.hostname()) return false; // cross-host: cannot probe; never steal
   const pid = meta.pid;
   if (!Number.isInteger(pid) || pid <= 0) return false;
-  const recorded = typeof meta.start === 'string' && meta.start ? meta.start : null;
-
-  // START IDENTITY FIRST — including when the recorded pid is OUR OWN (round-3
-  // review MAJOR: a `pid === process.pid` short-circuit declared "not stale"
-  // before comparing start times, so a crashed holder's lock whose pid THIS
-  // process happens to inherit could never be reclaimed and every acquisition
-  // timed out forever). A lock is "live" only when pid AND start identity match.
-  if (pid === process.pid) {
-    const mine = procStartTime(process.pid);
-    if (recorded && mine) return recorded !== mine; // reused pid => stale; same start => genuinely ours
-    return false; // identity unverifiable — never steal (see README: `ps` requirement)
-  }
-
   try {
     process.kill(pid, 0); // signal 0 only tests existence
   } catch (err) {
     if (err && err.code === 'ESRCH') return true; // no such process => stale
     return false; // EPERM etc.: exists but not ours to probe — treat as held
   }
-  // The pid exists. If we recorded a process start time and can read the current
-  // one, a MISMATCH means the pid was reused by an unrelated process => stale.
-  if (recorded) {
-    const now = procStartTime(pid);
-    if (now && now !== recorded) return true;
-  }
-  return false; // genuinely alive (or unverifiable) => held
+  return false; // pid exists => held
 }
 
 /**
- * Best-effort process start identity, used to detect PID reuse. Linux: field 22
- * of /proc/<pid>/stat (jiffies since boot). macOS/BSD: `ps -o lstart`. Returns
- * null when unavailable — callers then fall back to the age-based message.
- * @param {number} pid
- * @returns {string|null}
- */
-export function procStartTime(pid) {
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
-    const rparen = stat.lastIndexOf(')');
-    if (rparen !== -1) {
-      const fields = stat.slice(rparen + 2).trim().split(/\s+/);
-      // After ')' the next field is `state` (field 3); starttime is field 22.
-      const starttime = fields[19];
-      if (starttime) return `l:${starttime}`;
-    }
-  } catch {
-    // not Linux, or no /proc — fall through
-  }
-  try {
-    const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
-    return out ? `p:${out}` : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Build the acquire-timeout error. If the holder's liveness could not be verified
- * and the lock is old, point at manual recovery instead of an opaque timeout.
+ * Build the acquire-timeout error. If the lock is old, point at manual recovery
+ * instead of an opaque timeout.
  * @param {string} metaFile
  * @returns {SkillsyncError}
  */
@@ -218,17 +169,12 @@ function lockedError(metaFile) {
     // fall through with generic message
   }
   const dir = path.dirname(metaFile);
-  if (
-    meta &&
-    typeof meta.time === 'number' &&
-    Date.now() - meta.time > MAX_AGE_MS &&
-    (!meta.start || !procStartTime(meta.pid))
-  ) {
+  if (meta && typeof meta.time === 'number' && Date.now() - meta.time > MAX_AGE_MS) {
     return new SkillsyncError(
       'LOCK_STALE_SUSPECTED',
       `the project lock has been held since ${new Date(meta.time).toISOString()} by pid ${meta.pid} on ` +
-        `${meta.host}, and its liveness cannot be verified on this machine. If no skillsync operation is ` +
-        `actually running, remove the lock directory manually: rm -rf ${JSON.stringify(dir)}`,
+        `${meta.host}. If no skillsync operation is actually running, remove the lock directory ` +
+        `manually: rm -rf ${JSON.stringify(dir)}`,
     );
   }
   return new SkillsyncError(
