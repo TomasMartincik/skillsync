@@ -38,7 +38,7 @@ Requires Node ≥ 18 and git.
 | `suggest <skill>\|--new <name> [--file <path> \| -m "…"]` | File a **text-only** change request as a `suggest/<skill>-<slug>-<id>` branch on central. No diff machinery; the request is prose (from `--file`, `-m`, or stdin). Never force-pushed. |
 
 `init`, `add`, `remove`, `sync` take a project-scoped exclusive lock and run their entire
-`recover → read manifest → plan → apply` sequence **under** it (so two concurrent commands
+`read manifest → plan → install` sequence **under** it (so two concurrent commands
 queue and compose rather than clobbering each other). `add` full-clones central to validate a
 skill's publication history before pinning. `list` and `suggest` do not mutate project skill
 trees.
@@ -126,10 +126,10 @@ credentials; there is no persistent per-machine clone.
   hash against the recorded per-agent hash**, before any project file is swapped; a mismatch aborts
   cleanly. Reproducibility depends on central history retaining the pinned content.
 
-## Transactional materialization
+## Materialization
 
-A mutation is one transaction, with the **project lock acquired first** and held across the whole
-`recover → read manifest → plan → apply` sequence. Before the lock is taken, the project container
+A mutation runs with the **project lock acquired first** and held across the whole
+`read manifest → plan → install` sequence. Before the lock is taken, the project container
 is validated with non-following `lstat`s — a symlinked `.agents/` is refused, never followed out of
 the project. The lock is a directory published atomically by `rename` (with a random ownership
 token); acquisition **waits** for a concurrent holder and reclaims a lock only when its recorded
@@ -146,60 +146,35 @@ liveness cannot be verified and the lock is old, the timeout error explains manu
 > stale lock must then be removed by hand (`rm -rf .agents/.skillsync.lock`), as the timeout error
 > instructs.
 
-1. **stage** — generate each target's artifact into a private staging area under `.agents/`, then
-   **scan, validate, and hash the STAGED tree** (not the source checkout) and fsync it — files **and**
-   every nested directory. Regular-file fsync errors are fatal (a partial staged tree must never be
-   committed). The staged hash is authoritative — it is what the manifest records (`add`) or is
-   verified against (`sync`), and what recovery revalidates before every swap.
-2. **journal** — atomically write `.agents/.skillsync-txn.json` recording the complete next state as
-   **project-relative** paths, the authoritative staged hash per swap, and a **MAC** over the whole
-   body under a machine-local secret. Before journaling, the complete next manifest is validated,
-   every concrete staged/target/backup path is confined to an allowed root beneath the project,
-   symlinked ancestors are rejected, duplicate target/backup paths are rejected, and staging + all
-   targets/backups are verified to be on the **same filesystem** (so a rename can never fail with
-   `EXDEV` partway).
-3. **apply** — for each target: revalidate the staged tree against its journaled hash, move any
-   existing dir aside to a backup, then atomically rename the staged dir into place; then removals;
-   then write the manifest **last** via atomic rename. **Immediately before every rename** (swaps,
-   backups, and removals — after any callback), the source and destination parents are re-checked
-   with non-following `lstat`s and the staged tree is **re-hashed**, so an ancestor swapped for a
-   symlink, or staged bytes modified, after journal validation cannot be followed or installed.
-   Every directory the transaction creates (`.claude`, `.claude/skills`, `.agents`) and every rename
-   parent is fsynced, so a crash cannot leave a durable manifest describing a lost directory.
-4. **cleanup** — remove staging, backups, and the journal (only after a fully successful apply).
+1. **stage** — generate each target's artifact into a private (`0700`) staging dir under `.agents/`,
+   then **scan, validate, and hash the STAGED tree** (not the source checkout). The staged hash is
+   authoritative — it is what the manifest records (`add`) or is verified against (`sync`). Staged
+   files and the staged dir are fsynced so the tree is durable before it is installed.
+2. **install** — for each target, a plain existence check removes any current copy and the staged dir
+   is **atomically renamed** into place, so an agent never observes a half-written skill (`rename`
+   makes the whole new tree appear at once). Then removals are applied. Every directory skillsync
+   creates (`.claude`, `.claude/skills`, `.agents`) and every rename parent is fsynced.
+3. **manifest last** — the manifest is written **last** via write-temp + atomic rename. Because it
+   lands last and atomically, the manifest **always describes the last fully-completed state**.
 
-**Durability requirement.** The crash-safety above is only as good as `fsync`. Regular-file fsync
-failures are always fatal, and a filesystem that cannot fsync the directories skillsync renames into
-fails with a clear **`DURABILITY_UNSUPPORTED`** error naming the path and platform code (rather than
-a raw errno). Local filesystems (APFS, HFS+, ext4, xfs, btrfs, tmpfs) are supported; some
-network/FUSE mounts and restricted sandboxes are not. A directory fsync the platform reports as a
-no-op (`EINVAL`/`ENOTSUP`) is tolerated.
+**Durability.** A light `fsync` of the staged files and the directories skillsync renames into makes
+the manifest-last guarantee crash-durable. A regular-file fsync failure is fatal, and a filesystem
+that cannot fsync those directories fails with a clear **`DURABILITY_UNSUPPORTED`** error naming the
+path and platform code (rather than a raw errno). Local filesystems (APFS, HFS+, ext4, xfs, btrfs,
+tmpfs) are supported; some network/FUSE mounts and restricted sandboxes are not. A directory fsync
+the platform reports as a no-op (`EINVAL`/`ENOTSUP`) is tolerated.
 
-**Residual TOCTOU limit (documented, not a bug).** Confinement is enforced with non-following
-`lstat`s re-run immediately before each rename, and staging is private (`0700`). Complete
-confinement would require fd-relative, no-follow syscalls (`openat`/`renameat2` with
-`RESOLVE_NO_SYMLINKS`), which **zero-dependency Node cannot express** — `fs.rename` resolves its
-operands by path. A window therefore remains between the final check and the syscall. skillsync
-closes it as far as the platform allows and assumes a **non-hostile local user**: an attacker who
-can already write inside your project as you does not need this race. Adding a native dependency to
-eliminate it is explicitly out of scope (ADR 0003).
+**Crash model — recovery is re-running.** There is no journal, backup, or recovery state machine.
+Because the manifest is written last and atomically, it always reflects the last completed state; a
+crash mid-operation leaves at most (a) a stale staging dir — swept on the next lock acquisition
+(age-based, only dirs matching the staging-name pattern, never followed through a symlink) — and (b)
+copies whose on-disk hash does not match the manifest, which the next `sync`/`add` re-materializes.
+Recovering an interrupted run therefore means simply **running it again**.
 
-**Crash recovery is roll-forward and fail-closed.** At the start of every mutating command, under
-the lock, an interrupted transaction is rolled forward (`apply` is idempotent). A journal is
-executed only after its **MAC authenticates it** as created by a skillsync transaction on **this
-machine** and it is fully path-confined and same-device (all re-checked during recovery). The MAC is
-keyed on a machine-local secret (not the hostname or checkout path), so a hostname change or a
-same-filesystem project move is recovered rather than stranded. That secret
-(`$XDG_CONFIG_HOME/skillsync/secret`) is created **atomically and durably**: 32 random bytes are
-written to a private temp file, fsynced, and published with `link()` — which never clobbers a
-concurrent creator's key — and its directory is fsynced. Every read validates it (regular file,
-exactly 32 bytes, `0600`; a loosened mode is repaired). A wrong-length or non-regular secret is a
-loud `SECRET_INVALID` error: skillsync will **not** silently re-key, because that would reject every
-journal signed with the real one. When staging is present its hash is
-revalidated before the swap; when staging is **absent** the live target hash is verified before the
-swap is treated as complete — "staging missing" is never proof of completion. A corrupt, foreign, or
-tampered journal, or any ambiguity, is refused and **nothing is deleted**: staging, backups, and the
-journal are **preserved** for repair.
+**Local-user trust.** Confinement uses non-following `lstat`s and private staging; a fully
+race-proof, fd-relative install (`openat`/`renameat2`) is not expressible in zero-dependency Node, so
+skillsync assumes a **non-hostile local user** — an attacker who can already write inside your project
+as you does not need a TOCTOU race (ADR 0003).
 
 ## Filesystem input policy
 

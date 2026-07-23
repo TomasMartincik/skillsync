@@ -1,7 +1,6 @@
 /**
  * `skillsync remove <skill>…` — disable skills: drop their pins and delete their
- * materialized copies, transactionally. The whole read → recover → plan → apply
- * runs under the project lock.
+ * materialized copies. The whole read → plan → install runs under the project lock.
  * @module commands/remove
  */
 

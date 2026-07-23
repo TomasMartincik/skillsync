@@ -1,5 +1,5 @@
 /**
- * Shared command scaffolding: project resolution, the lock+recover+run wrapper,
+ * Shared command scaffolding: project resolution, the lock+sweep+run wrapper,
  * argument parsing, and an interactive-confirm helper.
  * @module commands/common
  */
@@ -9,7 +9,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { MANIFEST_PATH } from '../constants.js';
 import { acquireLock } from '../lock.js';
-import { recover, assertContainerSafe } from '../materialize.js';
+import { sweepStaging, assertContainerSafe } from '../materialize.js';
 
 /**
  * @typedef {Object} Project
@@ -26,8 +26,9 @@ export function resolveProject(cwd) {
 }
 
 /**
- * Run `fn` while holding the project lock, recovering any interrupted
- * transaction first.
+ * Run `fn` while holding the project lock, sweeping any orphaned staging left by a
+ * crashed run first. There is no journal to replay — recovery is simply re-running
+ * the command, which re-materializes anything whose hash does not match the manifest.
  * @template T
  * @param {string} projectDir
  * @param {() => Promise<T>} fn
@@ -35,11 +36,11 @@ export function resolveProject(cwd) {
  */
 export async function withLock(projectDir, fn) {
   // Confine BEFORE taking the lock: a symlinked `.agents` must never be followed
-  // by lock acquisition or recovery (CRITICAL: escape through `.agents`).
+  // by lock acquisition or the sweep (CRITICAL: escape through `.agents`).
   await assertContainerSafe(projectDir);
   const lock = await acquireLock(projectDir);
   try {
-    await recover(projectDir);
+    await sweepStaging(projectDir);
     return await fn();
   } finally {
     await lock.release();

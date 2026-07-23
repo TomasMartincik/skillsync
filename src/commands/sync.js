@@ -14,7 +14,7 @@
  * with a warning; only `--force` overwrites it. Only a genuinely absent copy
  * (ENOENT) is treated as "missing" and re-materialized without `--force`.
  *
- * The whole read → recover → plan → apply runs under the project lock.
+ * The whole read → plan → install runs under the project lock.
  *
  * @module commands/sync
  */

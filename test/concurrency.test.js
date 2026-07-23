@@ -87,11 +87,11 @@ test('two barrier-synchronized add processes both win: the lock forces the union
 /**
  * THE missing test (adversarial-review): two concurrent `add`s in separate real
  * processes must both succeed and compose into the UNION of their additions —
- * neither may clobber the other, and no lock/journal/staging residue may remain.
+ * neither may clobber the other, and no lock/staging residue may remain.
  *
  * The previous design read the manifest BEFORE locking, so two adds starting from
  * the same M0 both wrote M0+their-own-skill and one addition was lost. The rework
- * moves read→recover→plan→apply entirely under a blocking project lock, so the
+ * moves read→plan→install entirely under a blocking project lock, so the
  * second process observes the first's committed manifest and appends to it.
  */
 test('two concurrent add processes both win: final manifest is the union, no residue', async () => {
@@ -128,12 +128,11 @@ test('two concurrent add processes both win: final manifest is the union, no res
       }
     }
 
-    // No lock / journal / staging / backup residue.
+    // No lock / staging residue.
     await assert.rejects(fs.stat(path.join(proj, '.agents/.skillsync.lock')));
-    await assert.rejects(fs.stat(path.join(proj, '.agents/.skillsync-txn.json')));
     const agentsEntries = await fs.readdir(path.join(proj, '.agents'));
     assert.ok(
-      !agentsEntries.some((e) => e.includes('stage') || e.includes('backup') || e.includes('lock')),
+      !agentsEntries.some((e) => e.includes('stage') || e.includes('lock')),
       `unexpected residue: ${agentsEntries.join(', ')}`,
     );
   } finally {

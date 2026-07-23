@@ -56,8 +56,8 @@ export async function init(argv, ctx) {
   const manifest = emptyManifest({ source, mode });
 
   await withLock(ctx.cwd, async () => {
-    // Under the lock and after recovery: refuse if already initialized (a crashed
-    // init is first rolled forward by recover(), then seen here as initialized).
+    // Under the lock: refuse if already initialized. An interrupted init wrote no
+    // manifest (it lands last), so a re-run simply proceeds and initializes cleanly.
     if (await pathExists(project.manifestPath)) {
       throw new SkillsyncError('ALREADY_INIT', `already initialized: ${MANIFEST_PATH} exists`);
     }

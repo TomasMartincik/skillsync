@@ -2,7 +2,7 @@
  * `skillsync add <skill>…` — enable skills in this project at central's current
  * published version, materialize them, and record their pins.
  *
- * The entire read → recover → plan → apply state machine runs UNDER the project
+ * The entire read → plan → install runs UNDER the project
  * lock (adversarial-review CRITICAL: pre-lock planning lost concurrent updates).
  * The manifest is read fresh inside the lock, so two concurrent `add`s compose
  * into the union rather than clobbering each other.

@@ -7,10 +7,9 @@ import { remove } from '../src/commands/remove.js';
 import { tmpDir, rmrf } from './helpers.js';
 
 /**
- * Adversarial-review MAJOR: `add foo foo` produced an unrecoverable journal (two
- * swaps with identical target/backup), and `add foo --agents claude,claude` wrote
- * a manifest the tool then refused to read. Both are rejected up front, BEFORE any
- * network/clone or lock is taken.
+ * Adversarial-review MAJOR: `add foo foo` produced two installs with an identical
+ * target, and `add foo --agents claude,claude` wrote a manifest the tool then
+ * refused to read. Both are rejected up front, BEFORE any network/clone or lock.
  */
 test('add rejects duplicate positional skills before touching anything', async () => {
   const root = await tmpDir();
@@ -18,7 +17,7 @@ test('add rejects duplicate positional skills before touching anything', async (
     const proj = path.join(root, 'proj');
     await fs.mkdir(proj, { recursive: true });
     await assert.rejects(add(['foo', 'foo'], { cwd: proj }), (err) => err.code === 'DUPLICATE_INPUT');
-    // No manifest, lock, or journal was created.
+    // No manifest, lock, or staging was created.
     await assert.rejects(fs.stat(path.join(proj, '.agents')));
   } finally {
     await rmrf(root);

@@ -35,14 +35,12 @@ export const MODES = /** @type {const} */ (['committed', 'gitignored', 'plain'])
 /** Exclusive project lock (created with mkdir for atomicity). */
 export const LOCK_DIR = '.agents/.skillsync.lock';
 
-/** Transaction journal written before directory swaps; presence => recovery needed. */
-export const TXN_FILE = '.agents/.skillsync-txn.json';
-
-/** Prefix for per-operation staging directories. */
+/**
+ * Prefix for per-operation staging directories. A staged skill dir is renamed into
+ * place atomically; a crashed run's leftover staging dir is swept on the next lock
+ * acquisition.
+ */
 export const STAGE_PREFIX = '.agents/.skillsync-stage';
-
-/** Prefix for backup directories moved aside during an atomic swap. */
-export const BACKUP_PREFIX = '.agents/.skillsync-backup';
 
 // --- Filesystem input policy limits ---
 
