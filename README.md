@@ -31,7 +31,7 @@ Requires Node ≥ 18 and git.
 | Command | What it does |
 | --- | --- |
 | `init [--source <git-url>] [--mode committed\|gitignored\|plain] [--yes]` | Create the project manifest. Mode is proposed from git context (git repo → `committed`, else `plain`). `--source` is stored and, on first use, learned as this machine's default after a one-time confirmation (`--yes` to confirm non-interactively). |
-| `add <skill>… [--agents claude,codex]` | Enable skills at central's **current** published version (validating each skill's publication history), materialize them, and record their pins. `--agents` restricts which agents get a copy. |
+| `add <skill>… [--agents claude,codex]` | Enable skills at central's **current** published version, materialize them, and record their pins. `--agents` restricts which agents get a copy. |
 | `remove <skill>…` | Disable skills: drop their pins and delete their materialized copies. |
 | `sync [--force]` | Materialize **exactly** what the manifest pins (version-exact; the cached commit is not authoritative). Never advances pins. Skips a drifted or anomalous copy with a warning; `--force` overwrites it. |
 | `list` | Show pinned skills and each copy's status (`ok` / `missing` / `drifted` / `anomaly`). Read-only; no network. |
@@ -39,9 +39,9 @@ Requires Node ≥ 18 and git.
 
 `init`, `add`, `remove`, `sync` take a project-scoped exclusive lock and run their entire
 `read manifest → plan → install` sequence **under** it (so two concurrent commands
-queue and compose rather than clobbering each other). `add` full-clones central to validate a
-skill's publication history before pinning. `list` and `suggest` do not mutate project skill
-trees.
+queue and compose rather than clobbering each other). `add` clones central, records its HEAD
+commit and each skill's current published version, then pins it. `list` and `suggest` do not
+mutate project skill trees.
 
 ## Manifest schema (v1)
 
@@ -106,22 +106,19 @@ hashes are equal; each is computed independently so the future adaptation layer 
 Remote-first and tool-owned: every operation clones into a temp dir using your own git
 credentials; there is no persistent per-machine clone.
 
-- `add` full-clones central, records the HEAD commit and the skill's frontmatter version, and
-  **validates the skill's publication history** (versions must be unique and monotonic — a version
-  reused across a real skill-tree change, or a regression, is rejected). History is walked by
-  enumerating the **first-parent boundaries that changed anything in the skill's directory** — not
-  just its `SKILL.md`, so a commit touching only `scripts/helper.js` under an unchanged version is
-  caught as a duplicate version — and locating the skill directory **at each boundary**, so a skill
-  that moved (e.g. `old/foo` → `new/foo`) keeps every historical release resolvable. The scan is
-  batched (one `git log`, one `git cat-file --batch-check`) because it runs under the project lock.
+- `add` full-clones central and records the HEAD commit and the skill's frontmatter version as the
+  pin. Duplicate/regressed versions in central history are a single-author authoring error whose
+  guidance lives in the central repo; skillsync does not police it, because sync is already
+  protected by the commit + `sourceHash` pins (worst case is a clear resolve error, not a corrupt
+  copy).
 - `sync` reproduces the recorded **version**. The recorded `commit` is only a resolution cache and
   is **not authoritative**: it is accepted only if the skill at that commit declares the pinned
   version **and** its tree matches the recorded `sourceHash`. Retrieval escalates:
   1. **cache** — fetch the recorded commit; accept it only if version and tree both match;
-  2. **fast path / deepen / full** — `git fetch --depth 1 origin <commit>`, then `--deepen` in
-     steps, then unshallow / fetch all branches;
-  3. if the cache is stale/wrong-tree/unreachable, resolve the pinned **version** to a commit by
-     walking **first-parent** history (again enforcing uniqueness + monotonicity).
+  2. **fast path / full** — `git fetch --depth 1 origin <commit>`, else unshallow / fetch all
+     branches;
+  3. if the cache is stale/wrong-tree/unreachable, resolve the pinned **version** to a commit as the
+     **newest first-parent commit whose `<skill>/SKILL.md` declares it**.
   The fetched tree's hash is checked against the recorded `sourceHash`, **and each staged output
   hash against the recorded per-agent hash**, before any project file is swapped; a mismatch aborts
   cleanly. Reproducibility depends on central history retaining the pinned content.
@@ -133,42 +130,30 @@ A mutation runs with the **project lock acquired first** and held across the who
 is validated with non-following `lstat`s — a symlinked `.agents/` is refused, never followed out of
 the project. The lock is a directory published atomically by `rename` (with a random ownership
 token); acquisition **waits** for a concurrent holder and reclaims a lock only when its recorded
-holder is provably gone on this host — the pid no longer exists, or the pid exists but its process
-**start time** differs from the recorded one (so a reused pid does not strand the lock). Start
-identity is compared **before** any pid short-circuit, including when the recorded pid is the
-*current* process's own pid: a lock is treated as live only when pid **and** start identity match,
-so a crashed holder's lock whose pid this process happens to inherit is still reclaimable. When
-liveness cannot be verified and the lock is old, the timeout error explains manual recovery.
-
-> **Stale-lock reclaim needs a process-start probe.** On Linux it reads `/proc/<pid>/stat`; on
-> macOS it shells out to **`ps -o lstart= -p <pid>`**. If `ps` cannot be executed (a restricted
-> sandbox), start identity is unknown and skillsync **refuses to steal** the lock — safe, but a
-> stale lock must then be removed by hand (`rm -rf .agents/.skillsync.lock`), as the timeout error
-> instructs.
+holder is provably gone on this host — `kill(pid, 0)` reports **ESRCH** (no such process). A pid
+that still exists (including a reused one) is treated as held; the acquire timeout, and its
+manual-removal message for an old lock, cover that case.
 
 1. **stage** — generate each target's artifact into a private (`0700`) staging dir under `.agents/`,
    then **scan, validate, and hash the STAGED tree** (not the source checkout). The staged hash is
-   authoritative — it is what the manifest records (`add`) or is verified against (`sync`). Staged
-   files and the staged dir are fsynced so the tree is durable before it is installed.
+   authoritative — it is what the manifest records (`add`) or is verified against (`sync`).
 2. **install** — for each target, a plain existence check removes any current copy and the staged dir
    is **atomically renamed** into place, so an agent never observes a half-written skill (`rename`
-   makes the whole new tree appear at once). Then removals are applied. Every directory skillsync
-   creates (`.claude`, `.claude/skills`, `.agents`) and every rename parent is fsynced.
-3. **manifest last** — the manifest is written **last** via write-temp + atomic rename. Because it
-   lands last and atomically, the manifest **always describes the last fully-completed state**.
+   makes the whole new tree appear at once). Then removals are applied.
+3. **manifest last** — the manifest is written **last** via write-temp + **fsync** + atomic rename.
+   Because it lands last and atomically, the manifest **always describes the last fully-completed
+   state**.
 
-**Durability.** A light `fsync` of the staged files and the directories skillsync renames into makes
-the manifest-last guarantee crash-durable. A regular-file fsync failure is fatal, and a filesystem
-that cannot fsync those directories fails with a clear **`DURABILITY_UNSUPPORTED`** error naming the
-path and platform code (rather than a raw errno). Local filesystems (APFS, HFS+, ext4, xfs, btrfs,
-tmpfs) are supported; some network/FUSE mounts and restricted sandboxes are not. A directory fsync
-the platform reports as a no-op (`EINVAL`/`ENOTSUP`) is tolerated.
+**Durability.** The one `fsync` that matters is the manifest write: flushing its bytes before the
+rename keeps "the manifest describes the last completed state" honest across a power loss. Any fsync
+error propagates raw. Everything else relies on **idempotent re-run**, not on per-file or
+per-directory syncing.
 
-**Crash model — recovery is re-running.** There is no journal, backup, or recovery state machine.
-Because the manifest is written last and atomically, it always reflects the last completed state; a
-crash mid-operation leaves at most (a) a stale staging dir — swept on the next lock acquisition
-(age-based, only dirs matching the staging-name pattern, never followed through a symlink) — and (b)
-copies whose on-disk hash does not match the manifest, which the next `sync`/`add` re-materializes.
+**Crash model — recovery is re-running.** There is no backup or recovery state machine. Because the
+manifest is written last and atomically, it always reflects the last completed state; a crash
+mid-operation leaves at most (a) a stale staging dir — swept on the next lock acquisition (age-based,
+only dirs matching the staging-name pattern, never followed through a symlink) — and (b) copies
+whose on-disk hash does not match the manifest, which the next `sync`/`add` re-materializes.
 Recovering an interrupted run therefore means simply **running it again**.
 
 **Local-user trust.** Confinement uses non-following `lstat`s and private staging; a fully
@@ -182,9 +167,8 @@ Skill trees are validated before they are hashed or copied:
 
 - symlinks and non-regular files (FIFO/socket/device) are **rejected**;
 - per-file (5 MiB), per-skill (25 MiB), and file-count (2000) limits are enforced;
-- **case/Unicode-fold path collisions** are detected per path component, directories included — a
-  tree that is two entries on Linux but one on case-insensitive macOS (including file-vs-directory
-  and folded-directory aliases) is rejected;
+- **case-fold path collisions** are detected on the full relative path — a tree with two paths that
+  differ only by case (two entries on Linux, one on case-insensitive macOS) is rejected;
 - hashing and copying are streamed (bounded memory regardless of file size).
 
 Skill names are validated against the Agent Skills grammar (lowercase letters/digits/single
@@ -203,20 +187,16 @@ on a detached HEAD. Plain-mode and read-only operations never require a branch.
 
 ## YAML frontmatter reader
 
-The hand-rolled parser reads a leading `---`-delimited block (LF or CRLF) and extracts the keys
-skillsync needs (`name`, `version`, and the display-only `description`) **robustly**, while safely
-**ignoring** any other valid YAML rather than rejecting the whole block. It handles quoted scalars,
-unquoted scalars with trailing `#` comments, integers, booleans, `null`/`~`, inline (`[a, b]`) and
-block (`- a`) sequences, **folded `>` and literal `|` block scalars**, and **nested mappings**
-(consumed and ignored). Double-quoted strings implement the full **YAML escape table** (`\n`, `\t`,
-`\"`, `\\`, `\0`, `\a`, `\b`, `\v`, `\f`, `\e`, `\N`, `\_`, `\L`, `\P`, and `\xNN` / `\uNNNN` /
-`\UNNNNNNNN`); an **unknown or incomplete escape is rejected** rather than silently dropped, so
-malformed input such as `name: "f\oo"` can no longer be normalized into the valid identity `foo`.
-**Quoted top-level keys** (`"name": …`) are recognized, so they cannot hide a duplicate identity
-key. Decimal tokens (e.g. `1.10`) are kept as strings so version pins are never truncated, and a
-leading UTF-8 BOM is stripped. It still **fails closed** on an unterminated quote and on a duplicated
-`name`/`version` (identity keys must be unambiguous), and it never evaluates a `---js` block. Versions are canonicalized with BigInt
-(leading zeros stripped, arbitrary width) so `01.02` and `1.2` are the same pin and compare equal.
+skillsync consumes exactly two frontmatter fields — `name` (checked against the skill directory
+name) and `version` (re-constrained by `\d+\.\d+` normalization) — so the hand-rolled reader does
+the minimum needed to extract them robustly and **ignore everything else**. It reads a leading
+`---`-delimited block (LF or CRLF, leading UTF-8 BOM stripped) and, for each **top-level
+`key: value` line**, strips matching surrounding quotes off the value and records it as a string.
+Indented content (nested mappings, block scalars, sequence items) and non-`key: value` lines are
+**skipped, not rejected** — an exotic-but-valid YAML construct never fails a file. The **only**
+fail-closed case is a duplicated `name`/`version` (identity keys must be unambiguous); it also never
+evaluates a `---js` block. Versions are canonicalized with BigInt (leading zeros stripped, arbitrary
+width) so `01.02` and `1.2` are the same pin.
 
 ## Design
 
