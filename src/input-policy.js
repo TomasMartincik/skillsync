@@ -29,6 +29,9 @@ import { SkillsyncError } from './util.js';
  * @property {string} abs absolute path on disk
  * @property {number} size bytes
  * @property {boolean} exec whether the owner-execute bit is set
+ * @property {string} [content] adapter-synthesized bytes to stage inline instead
+ *   of streaming from `abs` (see adapt.js). scanSkillTree never sets this; it is a
+ *   forward-only extension the adaptation layer attaches to modified/generated files.
  */
 
 /**

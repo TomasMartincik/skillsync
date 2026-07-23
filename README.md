@@ -161,6 +161,39 @@ race-proof, fd-relative install (`openat`/`renameat2`) is not expressible in zer
 skillsync assumes a **non-hostile local user** — an attacker who can already write inside your project
 as you does not need a TOCTOU race (ADR 0003).
 
+## Per-agent adaptation
+
+The central format **is** Claude-native, so the stage step transforms each skill per target agent
+before hashing:
+
+- **Claude** (`.claude/skills/<name>/`) — copied **verbatim**. Nothing to translate.
+- **Codex** (`.agents/skills/<name>/`) — the SKILL.md frontmatter is rewritten and, where needed, a
+  sidecar is generated:
+  - **Invocation switch.** Claude's `disable-model-invocation: true` (in SKILL.md) and Codex's
+    `policy.allow_implicit_invocation: false` (in `agents/openai.yaml`) express the same intent —
+    *the model must not auto-invoke; the user still can* — with a different key, opposite polarity,
+    and a different file. skillsync **drops the Claude key** from the Codex SKILL.md and **emits (or
+    merges into) `agents/openai.yaml`** with `policy.allow_implicit_invocation: false`. A pre-existing
+    sidecar is **merged, not clobbered** (the `interface:`/`dependencies:` sections survive; only the
+    policy value is set). The Claude key is always removed from the Codex copy; the sidecar is written
+    only when it was `true`. Empirically verified against Codex CLI 0.144.1 (see research docs).
+  - **Claude-only keys** with no Codex equivalent (`when_to_use`, `user-invocable`, `allowed-tools`,
+    `disallowed-tools`, `model`, `effort`, `context`, `agent`, `hooks`, `paths`, `shell`, `arguments`,
+    `argument-hint`) are **dropped from the Codex copy with a one-line warning** naming the skill and
+    key. Codex would ignore them; shipping them is misleading.
+  - **Everything else** — body, supporting files, and spec-portable frontmatter (`name`,
+    `description`, `version`, `license`, …) — copies through byte-for-byte.
+
+Frontmatter rewriting is **textual**: the dropped key's line and any indented continuation lines are
+removed from the original block (no re-serialization), preserving formatting. Adaptation is
+**forward-only** — there is no de-adaptation path.
+
+Because the Codex and Claude copies now genuinely differ, their per-target `outputs.{claude,codex}`
+hashes stop being identical whenever a transform applies. Each copy is scanned and hashed
+**independently** off its staged tree, so drift detection remains correct per copy. The per-skill
+`agents: [...]` filter composes with the transforms: a `codex`-only skill materializes only the
+transformed Codex output.
+
 ## Filesystem input policy
 
 Skill trees are validated before they are hashed or copied:
