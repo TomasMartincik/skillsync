@@ -78,7 +78,20 @@ export async function writeSkill(skillDir, spec) {
 }
 
 /**
- * Build a central skills repo with a sequence of commits.
+ * The catalog is scoped to `skills/<name>` in the central repo (layout contract);
+ * this resolves a central-catalog skill dir so fixtures build the same shape the
+ * tool discovers.
+ * @param {string} centralDir
+ * @param {string} name
+ * @returns {string}
+ */
+export function centralSkillDir(centralDir, name) {
+  return path.join(centralDir, 'skills', name);
+}
+
+/**
+ * Build a central skills repo with a sequence of commits. Skills are written under
+ * `skills/<name>/` per the central-repo layout contract.
  * @param {string} dir
  * @param {{ message: string, skill: { name: string, version: string, body?: string, files?: Record<string,string> } }[]} commits
  * @returns {Promise<{ dir: string, commits: string[] }>}
@@ -88,7 +101,7 @@ export async function makeCentral(dir, commits) {
   gitSync(dir, ['init', '-q', '-b', 'main']);
   const shas = [];
   for (const c of commits) {
-    await writeSkill(path.join(dir, c.skill.name), c.skill);
+    await writeSkill(centralSkillDir(dir, c.skill.name), c.skill);
     gitSync(dir, ['add', '-A']);
     gitSync(dir, ['commit', '-q', '-m', c.message]);
     shas.push(gitSync(dir, ['rev-parse', 'HEAD']));

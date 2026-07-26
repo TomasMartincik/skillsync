@@ -6,6 +6,15 @@
 /** Manifest lives beside the canonical `.agents/skills/` copies it describes. */
 export const MANIFEST_PATH = '.agents/skills-manifest.json';
 
+/**
+ * Central-repo layout contract: distributable skills live under this subdir
+ * (`skills/<name>/SKILL.md`). The catalog is structural — the repo root and every
+ * other subtree are repo-private (meta-files, docs, repo-local tooling under
+ * `.claude/`/`.agents/`). Discovery, version resolution and publication scanning
+ * are all scoped here; nothing outside `skills/` is ever distributed.
+ */
+export const CATALOG_SUBDIR = 'skills';
+
 /** Claude Code reads skills from here. */
 export const CLAUDE_SKILLS_DIR = '.claude/skills';
 

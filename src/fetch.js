@@ -23,6 +23,7 @@ import path from 'node:path';
 import { git, gitOrThrow } from './git.js';
 import { parseFrontmatter } from './frontmatter.js';
 import { assertSkillName } from './skill-name.js';
+import { CATALOG_SUBDIR } from './constants.js';
 import { SkillsyncError } from './util.js';
 
 /** @returns {Promise<string>} a fresh temp directory */
@@ -157,8 +158,9 @@ export async function fullClone(source) {
 }
 
 /**
- * Resolve a version pin to the newest first-parent commit whose `<skill>/SKILL.md`
- * declares that version. The skill directory is located once (at HEAD of the clone);
+ * Resolve a version pin to the newest first-parent commit whose
+ * `skills/<skill>/SKILL.md` declares that version. The skill directory is located
+ * once (at HEAD of the clone) and is always the catalog path `skills/<skill>`;
  * a skill that has since moved resolves only versions published at its current path,
  * with a clear UNRESOLVABLE_PIN otherwise. `sync` is already protected by the
  * commit + sourceHash pins, so a duplicate version is at worst a resolve error, not
@@ -200,52 +202,28 @@ async function readSkillVersionAt(dir, commit, skillRel) {
 }
 
 /**
- * Locate the skill directory (the one containing SKILL.md) within a checkout.
- * Prefers `<root>/<skill>/SKILL.md`, then searches shallowly.
+ * Locate the distributable skill directory within a central checkout.
+ *
+ * The catalog is STRUCTURAL, not heuristic: a distributable skill lives at exactly
+ * `skills/<name>/SKILL.md`. The repo root (and any other subtree — `.claude/`,
+ * `.agents/`, `docs/`, `requests/`) is repo-private space that the tool never
+ * treats as catalog. There is no tree search: a name that is not present under
+ * `skills/` is SKILL_NOT_FOUND, even if a same-named dir exists elsewhere (e.g. the
+ * central repo's own repo-local `.claude/skills/<name>`). This is the boundary that
+ * keeps repo tooling out of the distributed catalog.
  * @param {string} dir checkout root
  * @param {string} skill
- * @returns {Promise<string>} POSIX relative path of the skill dir
+ * @returns {Promise<string>} POSIX relative path of the skill dir (`skills/<name>`)
  */
 export async function findSkillRel(dir, skill) {
   assertSkillName(skill);
-  const direct = path.join(dir, skill, 'SKILL.md');
-  if (await exists(direct)) return skill;
+  const rel = `${CATALOG_SUBDIR}/${skill}`;
+  if (await exists(path.join(dir, rel, 'SKILL.md'))) return rel;
 
-  // Shallow recursive search for a dir named `skill` containing SKILL.md.
-  const found = await searchSkill(dir, dir, skill, 0);
-  if (found) return found;
-
-  throw new SkillsyncError('SKILL_NOT_FOUND', `skill "${skill}" not found in source`);
-}
-
-/**
- * @param {string} root
- * @param {string} cur
- * @param {string} skill
- * @param {number} depth
- * @returns {Promise<string|null>}
- */
-async function searchSkill(root, cur, skill, depth) {
-  if (depth > 4) return null;
-  let entries;
-  try {
-    entries = await fs.readdir(cur, { withFileTypes: true });
-  } catch {
-    return null;
-  }
-  for (const e of entries) {
-    if (!e.isDirectory() || e.name === '.git') continue;
-    const abs = path.join(cur, e.name);
-    if (e.name === skill && (await exists(path.join(abs, 'SKILL.md')))) {
-      return path.relative(root, abs).split(path.sep).join('/');
-    }
-  }
-  for (const e of entries) {
-    if (!e.isDirectory() || e.name === '.git') continue;
-    const res = await searchSkill(root, path.join(cur, e.name), skill, depth + 1);
-    if (res) return res;
-  }
-  return null;
+  throw new SkillsyncError(
+    'SKILL_NOT_FOUND',
+    `skill "${skill}" not found under ${CATALOG_SUBDIR}/ in source`,
+  );
 }
 
 /**

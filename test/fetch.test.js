@@ -10,7 +10,7 @@ import {
   readSkillVersion,
   normalizeVersion,
 } from '../src/fetch.js';
-import { makeCentral, tmpDir, rmrf } from './helpers.js';
+import { makeCentral, writeSkill, gitSync, tmpDir, rmrf } from './helpers.js';
 
 test('normalizeVersion canonicalizes with BigInt', () => {
   assert.equal(normalizeVersion('1.2'), '1.2');
@@ -40,7 +40,7 @@ test('checkoutCommit reproduces an exact historical commit', async () => {
     const [c10] = central.commits;
     const co = await checkoutCommit(central.dir, c10);
     try {
-      const v = await readSkillVersion(path.join(co.dir, 'g'));
+      const v = await readSkillVersion(path.join(co.dir, 'skills', 'g'));
       assert.equal(v, '1.0');
     } finally {
       await co.cleanup();
@@ -73,15 +73,23 @@ test('resolveVersionToCommit maps version -> commit via first-parent history', a
   }
 });
 
-test('findSkillRel finds nested skills and errors on missing', async () => {
+test('findSkillRel resolves skills/<name> structurally and ignores non-catalog dirs', async () => {
   const root = await tmpDir();
   try {
     const central = await makeCentral(path.join(root, 'central'), [
       { message: 'v1', skill: { name: 'g', version: '1.0' } },
     ]);
+    // A same-named skill living OUTSIDE skills/ (repo-local tooling) must never be
+    // discovered as catalog — the boundary that keeps repo tooling undistributed.
+    await writeSkill(path.join(central.dir, '.claude/skills/g'), { name: 'g', version: '9.0' });
+    // A root-level skill dir (the old heuristic layout) is likewise not catalog.
+    await writeSkill(path.join(central.dir, 'h'), { name: 'h', version: '1.0' });
+    gitSync(central.dir, ['add', '-A']);
+    gitSync(central.dir, ['commit', '-q', '-m', 'repo-local + root dirs']);
     const clone = await fullClone(central.dir);
     try {
-      assert.equal(await findSkillRel(clone.dir, 'g'), 'g');
+      assert.equal(await findSkillRel(clone.dir, 'g'), 'skills/g');
+      await assert.rejects(findSkillRel(clone.dir, 'h'), /SKILL_NOT_FOUND|not found/);
       await assert.rejects(findSkillRel(clone.dir, 'nope'), /SKILL_NOT_FOUND|not found/);
     } finally {
       await clone.cleanup();

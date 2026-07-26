@@ -7,7 +7,7 @@ import { add } from '../src/commands/add.js';
 import { remove } from '../src/commands/remove.js';
 import { sync } from '../src/commands/sync.js';
 import { readManifest } from '../src/manifest.js';
-import { makeCentral, writeSkill, gitSync, tmpDir, rmrf } from './helpers.js';
+import { makeCentral, writeSkill, centralSkillDir, gitSync, tmpDir, rmrf } from './helpers.js';
 
 /** Run a body with a throwaway XDG_CONFIG_HOME so the real config is untouched. */
 async function withIsolatedConfig(root, fn) {
@@ -39,7 +39,7 @@ test('sync is version-exact: central advances but sync reproduces the pinned ver
       assert.equal(manifest.skills.g.version, '1.0');
 
       // Central ADVANCES to 1.1.
-      await writeSkill(path.join(central.dir, 'g'), { name: 'g', version: '1.1', body: 'TWO' });
+      await writeSkill(centralSkillDir(central.dir, 'g'), { name: 'g', version: '1.1', body: 'TWO' });
       gitSync(central.dir, ['add', '-A']);
       gitSync(central.dir, ['commit', '-q', '-m', 'v1.1']);
 

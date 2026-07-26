@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { readManifest } from '../src/manifest.js';
-import { makeCentral, writeSkill, gitSync, runCli, tmpDir, rmrf } from './helpers.js';
+import { makeCentral, writeSkill, centralSkillDir, gitSync, runCli, tmpDir, rmrf } from './helpers.js';
 
 const MANIFEST_REL = '.agents/skills-manifest.json';
 const CLAUDE = (skill) => `.claude/skills/${skill}/SKILL.md`;
@@ -15,7 +15,7 @@ function envFor(root) {
 
 /** Add a new commit to central that (re)writes a skill at a version/body. */
 function advance(centralDir, skill, version, body) {
-  return writeSkill(path.join(centralDir, skill), { name: skill, version, body }).then(() => {
+  return writeSkill(centralSkillDir(centralDir, skill), { name: skill, version, body }).then(() => {
     gitSync(centralDir, ['add', '-A']);
     gitSync(centralDir, ['commit', '-q', '-m', `${skill}@${version}`]);
   });
@@ -188,7 +188,7 @@ test('status classifies minor / major / current / deleted-centrally', async () =
     await advance(central.dir, 'a', '1.1', 'A2'); // minor
     await advance(central.dir, 'b', '2.0', 'B2'); // major
     // c unchanged (current)
-    await fs.rm(path.join(central.dir, 'd'), { recursive: true, force: true }); // deleted
+    await fs.rm(centralSkillDir(central.dir, 'd'), { recursive: true, force: true }); // deleted
     gitSync(central.dir, ['add', '-A']);
     gitSync(central.dir, ['commit', '-q', '-m', 'delete d']);
 

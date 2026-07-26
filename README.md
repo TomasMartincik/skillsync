@@ -164,6 +164,8 @@ hashes are equal; each is computed independently so the future adaptation layer 
 Remote-first and tool-owned: every operation clones into a temp dir using your own git
 credentials; there is no persistent per-machine clone.
 
+**Central-repo layout contract:** the distributable catalog is exactly `skills/<name>/SKILL.md`; the repo root and every other subtree (meta-files, `docs/`, and repo-local tooling under `.claude/`/`.agents/skills/`) are repo-private and never discovered, versioned, or distributed.
+
 - `add` full-clones central and records the HEAD commit and the skill's frontmatter version as the
   pin. Duplicate/regressed versions in central history are a single-author authoring error whose
   guidance lives in the central repo; skillsync does not police it, because sync is already
@@ -176,7 +178,7 @@ credentials; there is no persistent per-machine clone.
   2. **fast path / full** — `git fetch --depth 1 origin <commit>`, else unshallow / fetch all
      branches;
   3. if the cache is stale/wrong-tree/unreachable, resolve the pinned **version** to a commit as the
-     **newest first-parent commit whose `<skill>/SKILL.md` declares it**.
+     **newest first-parent commit whose `skills/<skill>/SKILL.md` declares it**.
   The fetched tree's hash is checked against the recorded `sourceHash`, **and each staged output
   hash against the recorded per-agent hash**, before any project file is swapped; a mismatch aborts
   cleanly. Reproducibility depends on central history retaining the pinned content.

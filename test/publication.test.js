@@ -7,7 +7,7 @@ import { init } from '../src/commands/init.js';
 import { add } from '../src/commands/add.js';
 import { sync } from '../src/commands/sync.js';
 import { readManifest, serializeManifest } from '../src/manifest.js';
-import { makeCentral, writeSkill, gitSync, tmpDir, rmrf } from './helpers.js';
+import { makeCentral, writeSkill, centralSkillDir, gitSync, tmpDir, rmrf } from './helpers.js';
 
 async function withIsolatedConfig(root, fn) {
   const prev = process.env.XDG_CONFIG_HOME;
@@ -63,7 +63,7 @@ test('version resolution overrides a wrong-but-reachable cached commit', async (
       await add(['foo'], { cwd: proj }); // pins version 1.0 @ the 1.0 commit
 
       // Central advances to 1.1; capture that (reachable) commit.
-      await writeSkill(path.join(central.dir, 'foo'), { name: 'foo', version: '1.1', body: 'TWO' });
+      await writeSkill(centralSkillDir(central.dir, 'foo'), { name: 'foo', version: '1.1', body: 'TWO' });
       gitSync(central.dir, ['add', '-A']);
       gitSync(central.dir, ['commit', '-q', '-m', 'v1.1']);
       const c11 = gitSync(central.dir, ['rev-parse', 'HEAD']);
