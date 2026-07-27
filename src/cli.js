@@ -81,7 +81,7 @@ Global scope: pass --global to init/add/remove/sync/update/status/list to manage
   ~/.agents/skills-manifest.json and is always mode "plain". Running a bare
   (non-global) command from your home directory is refused — pass --global.
 
-Global: this tool has zero npm dependencies and no build step.`;
+Notes: this tool has zero npm dependencies and no build step.`;
 
 /**
  * @param {string[]} argv process args after `node bin/skillsync.js`
