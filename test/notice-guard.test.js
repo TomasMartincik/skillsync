@@ -16,16 +16,19 @@ import { tmpDir, rmrf, BIN } from './helpers.js';
 const GUARD = path.join(path.dirname(BIN), 'skillsync-notice.js');
 
 /**
- * @param {{ cwd: string, agent?: string, env?: Record<string,string> }} opts
+ * @param {{ cwd: string, home?: string, agent?: string, env?: Record<string,string> }} opts
  * @returns {Promise<{ code: number, stdout: string, stderr: string }>}
  */
 function runGuard(opts) {
   const args = [GUARD];
   if (opts.agent) args.push('--agent', opts.agent);
+  // Pin HOME to a sandbox so the global-manifest fall-through is deterministic and
+  // never reads (or reports on) the developer's real ~/.agents manifest.
+  const home = opts.home ?? opts.cwd;
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, args, {
       cwd: opts.cwd,
-      env: { ...process.env, ...(opts.env ?? {}) },
+      env: { ...process.env, HOME: home, ...(opts.env ?? {}) },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -51,6 +54,12 @@ async function makeProjWithManifest(root) {
   return proj;
 }
 
+/** Write a global manifest directly under a sandbox HOME. @param {string} home */
+async function makeGlobalManifest(home) {
+  await fs.mkdir(path.join(home, '.agents'), { recursive: true });
+  await fs.writeFile(path.join(home, '.agents', 'skills-manifest.json'), '{"version":1}');
+}
+
 test('guard is silent when no manifest is found', async () => {
   const root = await tmpDir();
   try {
@@ -59,7 +68,7 @@ test('guard is silent when no manifest is found', async () => {
     // A stub that WOULD print, to prove the manifest gate short-circuits first.
     const stub = path.join(root, 'stub.sh');
     await writeStub(stub, '#!/bin/sh\necho "grilling 1.2 -> 1.3 (minor)"\n');
-    const r = await runGuard({ cwd: proj, env: { SKILLSYNC_BIN: stub } });
+    const r = await runGuard({ cwd: proj, home: root, env: { SKILLSYNC_BIN: stub } });
     assert.equal(r.code, 0);
     assert.equal(r.stdout.trim(), '', 'no output without a manifest');
   } finally {
@@ -71,7 +80,7 @@ test('guard is silent when the skillsync binary is missing', async () => {
   const root = await tmpDir();
   try {
     const proj = await makeProjWithManifest(root);
-    const r = await runGuard({ cwd: proj, env: { SKILLSYNC_BIN: path.join(root, 'does-not-exist') } });
+    const r = await runGuard({ cwd: proj, home: root, env: { SKILLSYNC_BIN: path.join(root, 'does-not-exist') } });
     assert.equal(r.code, 0);
     assert.equal(r.stdout.trim(), '');
   } finally {
@@ -85,7 +94,7 @@ test('guard is silent when status prints nothing (up to date)', async () => {
     const proj = await makeProjWithManifest(root);
     const stub = path.join(root, 'stub.sh');
     await writeStub(stub, '#!/bin/sh\nexit 0\n');
-    const r = await runGuard({ cwd: proj, env: { SKILLSYNC_BIN: stub } });
+    const r = await runGuard({ cwd: proj, home: root, env: { SKILLSYNC_BIN: stub } });
     assert.equal(r.code, 0);
     assert.equal(r.stdout.trim(), '');
   } finally {
@@ -99,7 +108,7 @@ test('guard emits the notice line for Claude (plain stdout), no migration warnin
     const proj = await makeProjWithManifest(root);
     const stub = path.join(root, 'stub.sh');
     await writeStub(stub, '#!/bin/sh\necho "grilling 1.2 -> 1.3 (minor)"\n');
-    const r = await runGuard({ cwd: proj, agent: 'claude', env: { SKILLSYNC_BIN: stub } });
+    const r = await runGuard({ cwd: proj, home: root, agent: 'claude', env: { SKILLSYNC_BIN: stub } });
     assert.equal(r.code, 0);
     assert.match(r.stdout, /grilling 1\.2 -> 1\.3 \(minor\)/);
     assert.doesNotMatch(r.stdout, /migration/i, 'no migration warning for a minor');
@@ -114,7 +123,7 @@ test('guard emits Codex JSON systemMessage and appends the migration warning for
     const proj = await makeProjWithManifest(root);
     const stub = path.join(root, 'stub.sh');
     await writeStub(stub, '#!/bin/sh\necho "grilling 1.2 -> 2.0 (major)"\n');
-    const r = await runGuard({ cwd: proj, agent: 'codex', env: { SKILLSYNC_BIN: stub } });
+    const r = await runGuard({ cwd: proj, home: root, agent: 'codex', env: { SKILLSYNC_BIN: stub } });
     assert.equal(r.code, 0);
     const payload = JSON.parse(r.stdout.trim());
     assert.ok(typeof payload.systemMessage === 'string', 'documented Codex shape');
@@ -134,7 +143,7 @@ test('guard finds the manifest in an ancestor directory', async () => {
     await fs.mkdir(deep, { recursive: true });
     const stub = path.join(root, 'stub.sh');
     await writeStub(stub, '#!/bin/sh\necho "grilling 1.2 -> 1.3 (minor)"\n');
-    const r = await runGuard({ cwd: deep, agent: 'claude', env: { SKILLSYNC_BIN: stub } });
+    const r = await runGuard({ cwd: deep, home: root, agent: 'claude', env: { SKILLSYNC_BIN: stub } });
     assert.match(r.stdout, /grilling/);
   } finally {
     await rmrf(root);
@@ -150,6 +159,7 @@ test('guard fails open (silent) when status times out', async () => {
     const start = Date.now();
     const r = await runGuard({
       cwd: proj,
+      home: root,
       agent: 'claude',
       env: { SKILLSYNC_BIN: stub, SKILLSYNC_NOTICE_TIMEOUT_MS: '400' },
     });
@@ -167,9 +177,44 @@ test('guard fails open (silent) when status exits non-zero', async () => {
     const proj = await makeProjWithManifest(root);
     const stub = path.join(root, 'fail.sh');
     await writeStub(stub, '#!/bin/sh\necho "boom" >&2\nexit 3\n');
-    const r = await runGuard({ cwd: proj, agent: 'claude', env: { SKILLSYNC_BIN: stub } });
+    const r = await runGuard({ cwd: proj, home: root, agent: 'claude', env: { SKILLSYNC_BIN: stub } });
     assert.equal(r.code, 0);
     assert.equal(r.stdout.trim(), '');
+  } finally {
+    await rmrf(root);
+  }
+});
+
+test('guard falls through to the global manifest and runs status --global', async () => {
+  const root = await tmpDir();
+  try {
+    // HOME has a global manifest; cwd is an ordinary HOME subdir with NO project.
+    await makeGlobalManifest(root);
+    const work = path.join(root, 'work');
+    await fs.mkdir(work, { recursive: true });
+    // Stub echoes the args it received so we can prove --global was passed through.
+    const stub = path.join(root, 'stub.sh');
+    await writeStub(stub, '#!/bin/sh\necho "pending [$*]"\n');
+    const r = await runGuard({ cwd: work, home: root, agent: 'claude', env: { SKILLSYNC_BIN: stub } });
+    assert.equal(r.code, 0);
+    assert.match(r.stdout, /pending/);
+    assert.match(r.stdout, /--global/, 'global fall-through passes --global to status');
+  } finally {
+    await rmrf(root);
+  }
+});
+
+test('guard prefers a project manifest over the global one (no --global)', async () => {
+  const root = await tmpDir();
+  try {
+    await makeGlobalManifest(root); // global manifest also present under HOME
+    const proj = await makeProjWithManifest(root); // but cwd is a real project
+    const stub = path.join(root, 'stub.sh');
+    await writeStub(stub, '#!/bin/sh\necho "pending [$*]"\n');
+    const r = await runGuard({ cwd: proj, home: root, agent: 'claude', env: { SKILLSYNC_BIN: stub } });
+    assert.equal(r.code, 0);
+    assert.match(r.stdout, /pending/);
+    assert.doesNotMatch(r.stdout, /--global/, 'project scope takes precedence, stays non-global');
   } finally {
     await rmrf(root);
   }

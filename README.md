@@ -42,9 +42,11 @@ node /path/to/skillsync/bin/skillsync.js <command>
 without disturbing any unrelated hooks. `install.sh` runs it as its last step. The hook runs a small
 guard (`bin/skillsync-notice.js`) that:
 
-- exits silently unless the current directory (or an ancestor) has a `.agents/skills-manifest.json`
-  **and** skillsync is installed;
-- otherwise runs `skillsync status --cached` (2s timeout, **fail-open** — any error is silent) and,
+- exits silently unless the current directory (or an ancestor below `$HOME`) has a
+  `.agents/skills-manifest.json`, **or** — failing that — the [global manifest](#global-scope) at
+  `~/.agents/skills-manifest.json` exists, **and** skillsync is installed;
+- otherwise runs `skillsync status --cached` (adding `--global` for the global-manifest fall-through;
+  2s timeout, **fail-open** — any error is silent) and,
   **only when updates are pending**, emits one advisory notice: plain stdout for Claude Code, the
   documented `{"systemMessage": "…"}` JSON for Codex. When a major bump is pending it appends a
   migration warning (major updates are migrations — analyze the impact before `update <skill>
@@ -100,6 +102,39 @@ Any command that already fetches central (`add`, `update`, `status`) refreshes a
 (`$XDG_CONFIG_HOME/skillsync/version-cache.json`), keyed by normalized source URL, written
 atomically (temp + rename). `status --cached` reads it with zero network cost and reports its age
 (`checked 3h ago`).
+
+## Global scope
+
+Agents also read a **user-level** skills scope that is available in every session regardless of
+cwd: Claude Code from `~/.claude/skills`, Codex from `~/.agents/skills`. Pass `--global` to
+`init`, `add`, `remove`, `sync`, `update`, `status`, or `list` to manage that scope instead of the
+current project. `--global` sets the operating root to `$HOME`; everything downstream (lock,
+staging, hashing, drift, adaptation, update machinery) is the same path-relative code the project
+scope uses — only the root changes.
+
+```sh
+skillsync init --global --source git@github.com:acme/skills.git   # ~/.agents/skills-manifest.json
+skillsync add --global grilling                                    # materializes into ~/.claude & ~/.agents
+skillsync status --global --cached
+```
+
+- **Always `plain`.** The global manifest lives at `~/.agents/skills-manifest.json` and is always
+  mode `plain` — `$HOME` is not a distribution-managed git repo, so `init --global --mode
+  committed|gitignored` is refused.
+- **Walk-up refusal.** A bare (non-`--global`) command whose root resolves to `$HOME` is refused
+  (`error [GLOBAL_SCOPE]`): managing the home scope must be explicit, so an uninitialized shell
+  sitting in `$HOME` never silently operates on it. A project whose root *is* `$HOME` works with
+  `--global`.
+- **Collisions.** `status` still warns when a project skill's name also exists in `~/.agents/skills`
+  (Codex reads both scopes without dedup) — this fires for globally-managed skills too. The reverse:
+  `add --global` warns when a skill name already has an **unmanaged** copy in a home skills dir
+  before it replaces it with the managed one.
+- **Unmanaged neighbors are untouched.** Skill dirs in `~/.claude/skills` / `~/.agents/skills` that
+  skillsync does not manage survive every global operation — only managed skills are ever written or
+  removed.
+- **Session-start hook.** With no project manifest up-tree, the [notice hook](#session-start-hooks)
+  falls through to the global manifest and reports pending **global** updates, under the same
+  silent-when-current, 2s fail-open contract.
 
 ## Manifest schema (v1)
 
