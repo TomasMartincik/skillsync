@@ -85,14 +85,19 @@ export async function add(argv, ctx) {
         }
         newPins.set(skill, pin);
         for (const s of specs) flatSpecs.push({ skill, ...s });
-        log(`add ${skill}@${pin.version} -> ${pinAgents(pin).join(', ')}`);
       }
 
       // Refuse to materialize over an EXTERNALLY-MANAGED target: a symlinked
       // existing copy (e.g. a GNU Stow entry from a dotfiles repo) must never be
       // unlinked. Catch it HERE, before any staging or install, with an actionable
       // remedy — rather than late in materialization with an opaque UNSAFE_ANCESTOR.
+      // (Also before the per-skill announce lines, so a refused add prints no
+      // success-looking output first.)
       await assertNoExternalTargets(project.dir, flatSpecs);
+
+      for (const [skill, pin] of newPins) {
+        log(`add ${skill}@${pin.version} -> ${pinAgents(pin).join(', ')}`);
+      }
 
       // Stage all targets, then record the AUTHORITATIVE staged hash per output.
       const staged = await stageTargets(project.dir, flatSpecs.map((s) => ({ target: s.target, files: s.files })));
