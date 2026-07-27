@@ -20,20 +20,10 @@ import { SkillsyncError } from '../util.js';
  */
 
 /**
- * The user's home directory — the root of the GLOBAL scope. Every homedir lookup
- * routes through here so `--global` and the HOME-shadow checks agree, and so tests
- * can point the whole tool at a sandbox by setting `$HOME`.
- * @returns {string}
- */
-export function homeRoot() {
-  return process.env.HOME || os.homedir();
-}
-
-/**
- * Canonical form for comparing two roots: resolve symlinks so a symlinked $HOME
- * component (e.g. macOS `/var` -> `/private/var`, or a home on a symlinked mount)
- * still compares equal to a realpath'd cwd. Falls back to a lexical resolve when
- * the path does not exist yet.
+ * Canonical form of a path: resolve symlinks so a symlinked $HOME component (e.g.
+ * macOS `/var` -> `/private/var`, or a home directory that is itself a symlink)
+ * still compares equal to — and materializes under — a realpath'd cwd. Falls back
+ * to a lexical resolve when the path does not exist yet.
  * @param {string} p
  * @returns {string}
  */
@@ -43,6 +33,18 @@ function canonical(p) {
   } catch {
     return path.resolve(p);
   }
+}
+
+/**
+ * The user's home directory — the root of the GLOBAL scope — in canonical form.
+ * Every homedir lookup routes through here so `--global` and the HOME-shadow
+ * checks agree, so tests can point the whole tool at a sandbox by setting `$HOME`,
+ * and so a symlinked home resolves to the real directory the container checks
+ * accept (a symlink would otherwise be rejected as "not a directory").
+ * @returns {string}
+ */
+export function homeRoot() {
+  return canonical(process.env.HOME || os.homedir());
 }
 
 /**
@@ -58,16 +60,15 @@ function canonical(p) {
  * @returns {string} absolute operating root
  */
 export function resolveRoot(ctx, flags = {}) {
-  const home = homeRoot();
+  const home = homeRoot(); // already canonical
   if (flags.global === true) return home;
-  const root = ctx.cwd;
-  if (canonical(root) === canonical(home)) {
+  if (canonical(ctx.cwd) === home) {
     throw new SkillsyncError(
       'GLOBAL_SCOPE',
-      `found the global manifest at ${canonical(home)}; pass --global to operate on the home (global) scope`,
+      `${home} is the home (global) scope, not a project; pass --global to operate on it`,
     );
   }
-  return root;
+  return ctx.cwd;
 }
 
 /**

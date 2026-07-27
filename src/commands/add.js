@@ -46,11 +46,13 @@ export async function add(argv, ctx) {
     const { warnings } = await preflight(project.dir, { mode: manifest.mode, manifestPath: project.manifestPath });
     for (const w of warnings) log(`warning: ${w}`);
 
-    // Reverse HOME-shadow warning: adding a skill globally whose name already has an
-    // UNMANAGED copy in a home skills dir. Codex/Claude would read that stray copy
-    // alongside (or instead of) the managed one; the managed materialization will
-    // replace it. Only flag names skillsync does not already track.
-    if (isGlobal) await warnUnmanagedGlobal(project.dir, positionals, manifest);
+    // Reverse HOME-shadow warning: adding a skill globally into an agent dir that
+    // already holds an UNMANAGED copy. Codex/Claude would read that stray copy
+    // alongside (or instead of) the managed one; the materialization will replace
+    // it. Flagged per newly-targeted agent — a plain re-add of an already-managed
+    // agent/name pair is silent, but expanding a skill to a NEW agent that has a
+    // stray copy there is not.
+    if (isGlobal) await warnUnmanagedGlobal(project.dir, positionals, agentsFilter, manifest);
 
     // Full clone: `add` records central's HEAD commit and the skill's current
     // published version; `sync` later reproduces exactly that pin.
@@ -118,17 +120,23 @@ export async function add(argv, ctx) {
 }
 
 /**
- * Warn for each named skill that is not yet managed here but whose target dir
- * already exists on disk (a pre-existing, unmanaged copy). One warning per stray
- * copy; skills already in the manifest are a normal re-add and never flagged.
+ * Warn for each (skill, newly-targeted agent) whose target dir already exists on
+ * disk while that agent/name pair is not yet managed — a pre-existing, unmanaged
+ * copy about to be replaced. Agents already managed for the skill are a normal
+ * re-add and never flagged, so expanding a skill to a new agent still warns about
+ * a stray copy there.
  * @param {string} root operating root ($HOME under --global)
  * @param {string[]} skills
+ * @param {string[]|undefined} agentsFilter agents this add targets (undefined => all)
  * @param {import('../manifest.js').Manifest} manifest
  */
-async function warnUnmanagedGlobal(root, skills, manifest) {
+async function warnUnmanagedGlobal(root, skills, agentsFilter, manifest) {
+  const targetAgents = agentsFilter ?? AGENTS;
   for (const skill of skills) {
-    if (manifest.skills[skill]) continue; // already managed here — a normal update
-    for (const agent of AGENTS) {
+    const prev = manifest.skills[skill];
+    const managed = new Set(prev ? pinAgents(prev) : []);
+    for (const agent of targetAgents) {
+      if (managed.has(agent)) continue; // already managed for this agent — a normal update
       const dir = path.join(root, AGENT_TARGETS[agent], skill);
       try {
         await fs.lstat(dir);

@@ -11,7 +11,9 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { tmpDir, rmrf, BIN } from './helpers.js';
+import {
+  tmpDir, rmrf, BIN, runCli, makeCentral, writeSkill, centralSkillDir, gitSync,
+} from './helpers.js';
 
 const GUARD = path.join(path.dirname(BIN), 'skillsync-notice.js');
 
@@ -192,12 +194,13 @@ test('guard falls through to the global manifest and runs status --global', asyn
     await makeGlobalManifest(root);
     const work = path.join(root, 'work');
     await fs.mkdir(work, { recursive: true });
-    // Stub echoes the args it received so we can prove --global was passed through.
+    // Stub echoes a pending line plus the args it received so we can prove --global
+    // was passed through (and that a pending line survives the guard's filter).
     const stub = path.join(root, 'stub.sh');
-    await writeStub(stub, '#!/bin/sh\necho "pending [$*]"\n');
+    await writeStub(stub, '#!/bin/sh\necho "g 1.2 -> 1.3 (minor) [$*]"\n');
     const r = await runGuard({ cwd: work, home: root, agent: 'claude', env: { SKILLSYNC_BIN: stub } });
     assert.equal(r.code, 0);
-    assert.match(r.stdout, /pending/);
+    assert.match(r.stdout, /1\.2 -> 1\.3/);
     assert.match(r.stdout, /--global/, 'global fall-through passes --global to status');
   } finally {
     await rmrf(root);
@@ -210,11 +213,71 @@ test('guard prefers a project manifest over the global one (no --global)', async
     await makeGlobalManifest(root); // global manifest also present under HOME
     const proj = await makeProjWithManifest(root); // but cwd is a real project
     const stub = path.join(root, 'stub.sh');
-    await writeStub(stub, '#!/bin/sh\necho "pending [$*]"\n');
+    await writeStub(stub, '#!/bin/sh\necho "g 1.2 -> 1.3 (minor) [$*]"\n');
     const r = await runGuard({ cwd: proj, home: root, agent: 'claude', env: { SKILLSYNC_BIN: stub } });
     assert.equal(r.code, 0);
-    assert.match(r.stdout, /pending/);
+    assert.match(r.stdout, /1\.2 -> 1\.3/);
     assert.doesNotMatch(r.stdout, /--global/, 'project scope takes precedence, stays non-global');
+  } finally {
+    await rmrf(root);
+  }
+});
+
+// --- End-to-end against the REAL `status --cached` (no stub) ---------------
+// These prove the guard's silence/emit behavior against the actual status table,
+// not just a hand-rolled stub.
+
+test('guard is silent against real status when everything is current', async () => {
+  const root = await tmpDir();
+  try {
+    const home = path.join(root, 'home');
+    await fs.mkdir(home, { recursive: true });
+    const central = await makeCentral(path.join(root, 'central'), [
+      { message: 'v1.0', skill: { name: 'g', version: '1.0', body: 'ONE' } },
+    ]);
+    const proj = path.join(root, 'proj');
+    await fs.mkdir(proj, { recursive: true });
+    const env = { HOME: home, XDG_CONFIG_HOME: path.join(root, 'xdg') };
+    await runCli(['init', '--source', central.dir, '--mode', 'plain'], { cwd: proj, env });
+    await runCli(['add', 'g'], { cwd: proj, env }); // manifest + cache both at 1.0
+
+    const r = await runGuard({ cwd: proj, home, agent: 'claude', env: { ...env, SKILLSYNC_BIN: BIN } });
+    assert.equal(r.code, 0);
+    assert.equal(r.stdout.trim(), '', 'real status table is filtered to nothing when current');
+  } finally {
+    await rmrf(root);
+  }
+});
+
+test('guard emits (from a nested cwd) against real status when a minor is pending', async () => {
+  const root = await tmpDir();
+  try {
+    const home = path.join(root, 'home');
+    await fs.mkdir(home, { recursive: true });
+    const central = await makeCentral(path.join(root, 'central'), [
+      { message: 'v1.0', skill: { name: 'g', version: '1.0', body: 'ONE' } },
+    ]);
+    const proj = path.join(root, 'proj');
+    await fs.mkdir(proj, { recursive: true });
+    const env = { HOME: home, XDG_CONFIG_HOME: path.join(root, 'xdg') };
+    await runCli(['init', '--source', central.dir, '--mode', 'plain'], { cwd: proj, env });
+    await runCli(['add', 'g'], { cwd: proj, env });
+
+    // Central advances to 1.1; an online status refreshes the cache so --cached now
+    // sees a pending minor while the manifest stays pinned at 1.0.
+    await writeSkill(centralSkillDir(central.dir, 'g'), { name: 'g', version: '1.1', body: 'TWO' });
+    gitSync(central.dir, ['add', '-A']);
+    gitSync(central.dir, ['commit', '-q', '-m', 'v1.1']);
+    await runCli(['status'], { cwd: proj, env });
+
+    // Run the guard from a nested subdirectory: it must still find the project root
+    // and report the pending update (not silently fail resolving the manifest).
+    const nested = path.join(proj, 'a', 'b', 'c');
+    await fs.mkdir(nested, { recursive: true });
+    const r = await runGuard({ cwd: nested, home, agent: 'claude', env: { ...env, SKILLSYNC_BIN: BIN } });
+    assert.equal(r.code, 0);
+    assert.match(r.stdout, /-> 1\.1/, 'pending minor is reported from a nested cwd');
+    assert.doesNotMatch(r.stdout, /source:/, 'status table headers are filtered out');
   } finally {
     await rmrf(root);
   }

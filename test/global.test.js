@@ -200,3 +200,71 @@ test('global status does NOT warn about its own managed HOME copy', async () => 
     await rmrf(root);
   }
 });
+
+test('list --global and update --global operate on the HOME scope', async () => {
+  const { root, home, central, env } = await sandbox();
+  try {
+    await runCli(['init', '--global', '--source', central.dir], { cwd: home, env });
+    await runCli(['add', '--global', 'g'], { cwd: home, env });
+
+    const ls = await runCli(['list', '--global'], { cwd: home, env });
+    assert.equal(ls.code, 0, ls.stderr);
+    assert.match(ls.stdout, /g@1\.0/);
+
+    // Central advances; update --global applies the pending minor to the HOME copy.
+    await writeSkill(centralSkillDir(central.dir, 'g'), { name: 'g', version: '1.1', body: 'TWO' });
+    gitSync(central.dir, ['add', '-A']);
+    gitSync(central.dir, ['commit', '-q', '-m', 'v1.1']);
+    const up = await runCli(['update', '--global'], { cwd: home, env });
+    assert.equal(up.code, 0, up.stderr);
+    assert.match(up.stdout, /update g 1\.0 -> 1\.1/);
+
+    const m = await readManifest(path.join(home, GLOBAL_MANIFEST));
+    assert.equal(m.skills.g.version, '1.1');
+    assert.match(await fs.readFile(path.join(home, '.agents/skills/g/SKILL.md'), 'utf8'), /TWO/);
+  } finally {
+    await rmrf(root);
+  }
+});
+
+test('global operations resolve a symlinked $HOME to the real directory', async () => {
+  const { root, central } = await sandbox();
+  try {
+    // $HOME is itself a symlink to the real home dir (some real-world setups do this).
+    const real = path.join(root, 'realhome');
+    await fs.mkdir(real, { recursive: true });
+    const link = path.join(root, 'homelink');
+    await fs.symlink(real, link);
+    const env = { HOME: link, XDG_CONFIG_HOME: path.join(root, 'xdg') };
+
+    const init = await runCli(['init', '--global', '--source', central.dir], { cwd: link, env });
+    assert.equal(init.code, 0, init.stderr);
+    const add = await runCli(['add', '--global', 'g'], { cwd: link, env });
+    assert.equal(add.code, 0, add.stderr);
+    // Materialized under the REAL directory, reachable through the symlink.
+    assert.ok((await fs.stat(path.join(real, '.claude/skills/g'))).isDirectory());
+  } finally {
+    await rmrf(root);
+  }
+});
+
+test('add --global warns when EXPANDING a managed skill to a new agent that has a stray copy', async () => {
+  const { root, home, central, env } = await sandbox();
+  try {
+    await runCli(['init', '--global', '--source', central.dir], { cwd: home, env });
+    // Manage g for claude only.
+    await runCli(['add', '--global', 'g', '--agents', 'claude'], { cwd: home, env });
+    // An unmanaged copy appears in the Codex dir (not yet a target agent).
+    const stray = path.join(home, '.agents/skills/g');
+    await fs.mkdir(stray, { recursive: true });
+    await fs.writeFile(path.join(stray, 'SKILL.md'), 'stray', 'utf8');
+
+    // Re-add without a filter → expands to codex, whose dir already has a stray copy.
+    const add = await runCli(['add', '--global', 'g'], { cwd: home, env });
+    assert.equal(add.code, 0, add.stderr);
+    assert.match(add.stderr, /unmanaged copy already exists/);
+    assert.match(add.stderr, /\.agents\/skills\/g/, 'warns for the newly-targeted Codex agent');
+  } finally {
+    await rmrf(root);
+  }
+});

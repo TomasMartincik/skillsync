@@ -15,18 +15,21 @@
  *      exit 0 silent.
  *   2. Resolve the skillsync binary (SKILLSYNC_BIN, else the sibling
  *      `skillsync.js`). Missing → exit 0 silent.
- *   3. Run `skillsync status --cached [--global]` with a short timeout. ANY error,
- *      non-zero exit, or timeout → exit 0 silent (fail open).
- *   4. No stdout → exit 0 silent (nothing pending).
+ *   3. Run `skillsync status --cached [--global]` in the manifest's directory with
+ *      a short timeout. ANY error, non-zero exit, or timeout → exit 0 silent (fail
+ *      open).
+ *   4. Keep only lines announcing a pending update (a "-> <version>" transition),
+ *      dropping the status table's headers and up-to-date lines. None → exit 0
+ *      silent (nothing pending).
  *   5. Otherwise emit the notice: Codex gets the documented
- *      `{"systemMessage": "..."}` JSON; Claude Code gets plain stdout. When the
- *      status output mentions a major bump, append the migration warning.
+ *      `{"systemMessage": "..."}` JSON; Claude Code gets plain stdout. When a kept
+ *      line mentions a major bump, append the migration warning.
  *
- * CONTRACT with `skillsync status --cached` (built separately): exit 0 and print
- * nothing when nothing is pending; exit 0 and print one human line per pending
- * update otherwise, where a major-version jump's line contains the token
- * "major". This guard only relays and classifies that output — it does no
- * version math of its own.
+ * `skillsync status --cached` prints a full human table (source/mode/cache headers
+ * plus one line per skill); a pending update is the only line carrying a
+ * "-> <version>" transition, and a major jump's line contains the token "major".
+ * This guard filters to those lines and classifies them — it does no version math
+ * of its own and never mutates anything.
  */
 
 import { spawnSync } from 'node:child_process';
@@ -63,17 +66,18 @@ function homeDir(env) {
 
 /**
  * Walk up from `start` for a PROJECT manifest, stopping AT $HOME: the home manifest
- * is the global scope, never treated as a project. Returns true when a project
- * manifest is found strictly below $HOME. `home` must already be canonical.
- * @param {string} start @param {string} home @returns {boolean}
+ * is the global scope, never treated as a project. Returns the directory that holds
+ * the manifest (so status runs there, not in a nested subdir), or null. `home` must
+ * already be canonical.
+ * @param {string} start @param {string} home @returns {string|null}
  */
-function hasProjectManifest(start, home) {
+function findProjectManifest(start, home) {
   let dir = path.resolve(start);
   for (;;) {
-    if (dir === home) return false; // reached the global scope — not a project
-    if (existsSync(path.join(dir, MANIFEST_REL))) return true;
+    if (dir === home) return null; // reached the global scope — not a project
+    if (existsSync(path.join(dir, MANIFEST_REL))) return dir;
     const parent = path.dirname(dir);
-    if (parent === dir) return false;
+    if (parent === dir) return null;
     dir = parent;
   }
 }
@@ -100,12 +104,19 @@ function main() {
   const home = homeDir(env);
 
   // Project scope takes precedence; otherwise fall through to the global manifest.
+  // status runs in the directory that actually holds the manifest — a project
+  // manifest lives at its root, not necessarily in a nested cwd.
+  const projectDir = findProjectManifest(cwd, home);
   /** @type {string[]} */
   let statusArgs;
-  if (hasProjectManifest(cwd, home)) {
+  /** @type {string} */
+  let runCwd;
+  if (projectDir) {
     statusArgs = ['status', '--cached'];
+    runCwd = projectDir;
   } else if (existsSync(path.join(home, MANIFEST_REL))) {
     statusArgs = ['status', '--cached', '--global'];
+    runCwd = home;
   } else {
     return; // nothing to report
   }
@@ -117,7 +128,7 @@ function main() {
   let res;
   try {
     res = spawnSync(bin.cmd, [...bin.pre, ...statusArgs], {
-      cwd,
+      cwd: runCwd,
       timeout,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
@@ -128,11 +139,19 @@ function main() {
   // Timeout (res.signal set / res.error) or non-zero exit → stay silent.
   if (!res || res.error || res.status !== 0) return;
 
-  const body = String(res.stdout || '').trim();
-  if (body === '') return;
+  // `status --cached` prints a full human table (source/mode/cache headers + one
+  // line per skill, up-to-date ones included). Only lines announcing a pending
+  // update carry a "-> <version>" transition; keep those and stay silent when
+  // there are none. This realizes the silent-when-current contract regardless of
+  // the table's headers, and matches the pending lines the tests' stubs emit.
+  const pending = String(res.stdout || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.includes('->'));
+  if (pending.length === 0) return;
 
-  let notice = body;
-  if (/major/i.test(body)) notice += `\n\n${MIGRATION_WARNING}`;
+  let notice = pending.join('\n');
+  if (/major/i.test(notice)) notice += `\n\n${MIGRATION_WARNING}`;
 
   if (agent === 'codex') {
     process.stdout.write(`${JSON.stringify({ systemMessage: notice })}\n`);
