@@ -88,6 +88,12 @@ export async function add(argv, ctx) {
         log(`add ${skill}@${pin.version} -> ${pinAgents(pin).join(', ')}`);
       }
 
+      // Refuse to materialize over an EXTERNALLY-MANAGED target: a symlinked
+      // existing copy (e.g. a GNU Stow entry from a dotfiles repo) must never be
+      // unlinked. Catch it HERE, before any staging or install, with an actionable
+      // remedy — rather than late in materialization with an opaque UNSAFE_ANCESTOR.
+      await assertNoExternalTargets(project.dir, flatSpecs);
+
       // Stage all targets, then record the AUTHORITATIVE staged hash per output.
       const staged = await stageTargets(project.dir, flatSpecs.map((s) => ({ target: s.target, files: s.files })));
       for (let i = 0; i < flatSpecs.length; i++) {
@@ -138,12 +144,47 @@ async function warnUnmanagedGlobal(root, skills, agentsFilter, manifest) {
     for (const agent of targetAgents) {
       if (managed.has(agent)) continue; // already managed for this agent — a normal update
       const dir = path.join(root, AGENT_TARGETS[agent], skill);
+      let st;
       try {
-        await fs.lstat(dir);
-        warn(`${skill}: an unmanaged copy already exists at ${dir}; adding it globally will replace that copy`);
+        st = await fs.lstat(dir);
       } catch {
-        // absent — nothing to warn about
+        continue; // absent — nothing to warn about
       }
+      // A symlinked copy is externally managed (e.g. GNU Stow); it is refused early
+      // with an actionable EXTERNAL_TARGET error, so do NOT also "will replace" warn.
+      if (st.isSymbolicLink()) continue;
+      warn(`${skill}: an unmanaged copy already exists at ${dir}; adding it globally will replace that copy`);
+    }
+  }
+}
+
+/**
+ * Fail early if any planned target's existing on-disk copy is a SYMLINK. Such a
+ * copy is externally managed (e.g. a GNU Stow entry from a dotfiles repo);
+ * skillsync must never unlink it, and catching it here — before any staging or
+ * install — yields an actionable remedy instead of the opaque late UNSAFE_ANCESTOR
+ * from materialization. Scope-agnostic: `root` is the operating root ($HOME under
+ * --global), so it guards both project and global scope.
+ * @param {string} root
+ * @param {{ target: string }[]} specs planned targets (repo-relative dirs)
+ */
+async function assertNoExternalTargets(root, specs) {
+  const seen = new Set();
+  for (const { target } of specs) {
+    if (seen.has(target)) continue;
+    seen.add(target);
+    const abs = path.join(root, target);
+    let st;
+    try {
+      st = await fs.lstat(abs);
+    } catch {
+      continue; // absent — nothing to replace
+    }
+    if (st.isSymbolicLink()) {
+      throw new SkillsyncError(
+        'EXTERNAL_TARGET',
+        `target ${abs} is a symlink — it appears externally managed (e.g. GNU Stow); remove or unstow it first, then re-run.`,
+      );
     }
   }
 }
