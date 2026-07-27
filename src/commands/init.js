@@ -17,7 +17,7 @@ import { getDefaultSource, setDefaultSource, normalizeSource } from '../config.j
 import { applyChanges } from '../materialize.js';
 import { excludeEntriesFor } from '../plan.js';
 import { SkillsyncError, log, warn } from '../util.js';
-import { resolveProject, withLock, parseArgs, confirm, pathExists } from './common.js';
+import { resolveProject, resolveRoot, withLock, parseArgs, confirm, pathExists } from './common.js';
 
 /**
  * @param {string[]} argv
@@ -25,17 +25,28 @@ import { resolveProject, withLock, parseArgs, confirm, pathExists } from './comm
  */
 export async function init(argv, ctx) {
   const { flags } = parseArgs(argv, { valueFlags: ['source', 'mode'] });
-  const project = resolveProject(ctx.cwd);
+  const isGlobal = flags.global === true;
+  const project = resolveProject(resolveRoot(ctx, flags));
 
-  // Mode.
+  // Mode. The global scope ($HOME) is not a distribution-managed git repo, so it is
+  // always `plain`; committed/gitignored are refused rather than silently coerced.
   let mode;
-  if (typeof flags.mode === 'string') {
+  if (isGlobal) {
+    if (typeof flags.mode === 'string' && flags.mode !== 'plain') {
+      throw new SkillsyncError(
+        'BAD_MODE',
+        'the global scope is always plain; --mode committed/gitignored cannot be combined with --global',
+      );
+    }
+    mode = 'plain';
+    log('global scope: mode is plain (HOME is not a distribution-managed git repo)');
+  } else if (typeof flags.mode === 'string') {
     if (!MODES.includes(/** @type {any} */ (flags.mode))) {
       throw new SkillsyncError('BAD_MODE', `--mode must be one of ${MODES.join(', ')}`);
     }
     mode = flags.mode;
   } else {
-    const st = await repoState(ctx.cwd);
+    const st = await repoState(project.dir);
     mode = st.isRepo ? 'committed' : 'plain';
     log(`proposed mode: ${mode}${st.isRepo ? ' (use --mode gitignored for team repos)' : ''}`);
   }
@@ -55,17 +66,17 @@ export async function init(argv, ctx) {
 
   const manifest = emptyManifest({ source, mode });
 
-  await withLock(ctx.cwd, async () => {
+  await withLock(project.dir, async () => {
     // Under the lock: refuse if already initialized. An interrupted init wrote no
     // manifest (it lands last), so a re-run simply proceeds and initializes cleanly.
     if (await pathExists(project.manifestPath)) {
       throw new SkillsyncError('ALREADY_INIT', `already initialized: ${MANIFEST_PATH} exists`);
     }
     // Preflight git for committed/gitignored.
-    const { warnings } = await preflight(ctx.cwd, { mode, manifestPath: project.manifestPath });
+    const { warnings } = await preflight(project.dir, { mode, manifestPath: project.manifestPath });
     for (const w of warnings) warn(w);
 
-    await applyChanges(ctx.cwd, {
+    await applyChanges(project.dir, {
       manifest,
       targets: [],
       removeDirs: [],

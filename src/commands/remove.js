@@ -10,14 +10,14 @@ import { applyChanges } from '../materialize.js';
 import { excludeEntriesFor, targetDir } from '../plan.js';
 import { assertSkillName } from '../skill-name.js';
 import { SkillsyncError, log, warn } from '../util.js';
-import { resolveProject, withLock, parseArgs } from './common.js';
+import { resolveProject, resolveRoot, withLock, parseArgs } from './common.js';
 
 /**
  * @param {string[]} argv
  * @param {{ cwd: string }} ctx
  */
 export async function remove(argv, ctx) {
-  const { positionals } = parseArgs(argv);
+  const { positionals, flags } = parseArgs(argv);
   if (positionals.length === 0) throw new SkillsyncError('USAGE', 'usage: skillsync remove <skill>…');
   for (const skill of positionals) assertSkillName(skill, 'skill argument');
   const seen = new Set();
@@ -26,11 +26,11 @@ export async function remove(argv, ctx) {
     seen.add(skill);
   }
 
-  const project = resolveProject(ctx.cwd);
+  const project = resolveProject(resolveRoot(ctx, flags));
 
-  await withLock(ctx.cwd, async () => {
+  await withLock(project.dir, async () => {
     const manifest = await readManifest(project.manifestPath);
-    const { warnings } = await preflight(ctx.cwd, { mode: manifest.mode, manifestPath: project.manifestPath });
+    const { warnings } = await preflight(project.dir, { mode: manifest.mode, manifestPath: project.manifestPath });
     for (const w of warnings) warn(w);
 
     /** @type {string[]} */
@@ -48,7 +48,7 @@ export async function remove(argv, ctx) {
 
     if (removeDirs.length === 0) return;
 
-    await applyChanges(ctx.cwd, {
+    await applyChanges(project.dir, {
       manifest,
       targets: [],
       removeDirs,

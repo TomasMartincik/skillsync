@@ -4,12 +4,14 @@
  * @module commands/common
  */
 
-import { promises as fs } from 'node:fs';
+import { promises as fs, realpathSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import { MANIFEST_PATH } from '../constants.js';
 import { acquireLock } from '../lock.js';
 import { sweepStaging, assertContainerSafe } from '../materialize.js';
+import { SkillsyncError } from '../util.js';
 
 /**
  * @typedef {Object} Project
@@ -18,11 +20,62 @@ import { sweepStaging, assertContainerSafe } from '../materialize.js';
  */
 
 /**
- * @param {string} cwd
+ * The user's home directory — the root of the GLOBAL scope. Every homedir lookup
+ * routes through here so `--global` and the HOME-shadow checks agree, and so tests
+ * can point the whole tool at a sandbox by setting `$HOME`.
+ * @returns {string}
+ */
+export function homeRoot() {
+  return process.env.HOME || os.homedir();
+}
+
+/**
+ * Canonical form for comparing two roots: resolve symlinks so a symlinked $HOME
+ * component (e.g. macOS `/var` -> `/private/var`, or a home on a symlinked mount)
+ * still compares equal to a realpath'd cwd. Falls back to a lexical resolve when
+ * the path does not exist yet.
+ * @param {string} p
+ * @returns {string}
+ */
+function canonical(p) {
+  try {
+    return realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
+/**
+ * Resolve the operating root from the invocation context and flags.
+ *
+ * - `--global` targets $HOME regardless of cwd (the documented user scope).
+ * - Without `--global`, the root is cwd. If cwd IS $HOME, refuse: the home
+ *   directory is the global scope and operating on it must be explicit — never
+ *   silently manage HOME from an ordinary project invocation.
+ *
+ * @param {{ cwd: string }} ctx
+ * @param {Record<string, string|boolean>} [flags]
+ * @returns {string} absolute operating root
+ */
+export function resolveRoot(ctx, flags = {}) {
+  const home = homeRoot();
+  if (flags.global === true) return home;
+  const root = ctx.cwd;
+  if (canonical(root) === canonical(home)) {
+    throw new SkillsyncError(
+      'GLOBAL_SCOPE',
+      `found the global manifest at ${canonical(home)}; pass --global to operate on the home (global) scope`,
+    );
+  }
+  return root;
+}
+
+/**
+ * @param {string} dir
  * @returns {Project}
  */
-export function resolveProject(cwd) {
-  return { dir: cwd, manifestPath: path.join(cwd, MANIFEST_PATH) };
+export function resolveProject(dir) {
+  return { dir, manifestPath: path.join(dir, MANIFEST_PATH) };
 }
 
 /**

@@ -41,7 +41,7 @@ import { excludeEntriesFor } from '../plan.js';
 import { refreshFromCentral } from '../version-cache.js';
 import { assertSkillName } from '../skill-name.js';
 import { SkillsyncError, log, warn } from '../util.js';
-import { resolveProject, withLock, parseArgs } from './common.js';
+import { resolveProject, resolveRoot, withLock, parseArgs } from './common.js';
 
 /**
  * @param {string[]} argv
@@ -64,28 +64,28 @@ export async function update(argv, ctx) {
     if (positionals.length === 0) throw new SkillsyncError('USAGE', 'update --to <version> requires a named skill');
   }
 
-  const project = resolveProject(ctx.cwd);
+  const project = resolveProject(resolveRoot(ctx, flags));
   const opts = { positionals, major, force, to, preview };
 
   if (preview) {
     const manifest = await readManifest(project.manifestPath);
-    await run(ctx, manifest, opts);
+    await run(project.dir, manifest, opts);
     return;
   }
-  await withLock(ctx.cwd, async () => {
+  await withLock(project.dir, async () => {
     const manifest = await readManifest(project.manifestPath);
-    const { warnings } = await preflight(ctx.cwd, { mode: manifest.mode, manifestPath: project.manifestPath });
+    const { warnings } = await preflight(project.dir, { mode: manifest.mode, manifestPath: project.manifestPath });
     for (const w of warnings) warn(w);
-    await run(ctx, manifest, opts);
+    await run(project.dir, manifest, opts);
   });
 }
 
 /**
- * @param {{ cwd: string }} ctx
+ * @param {string} root
  * @param {import('../manifest.js').Manifest} manifest
  * @param {{ positionals: string[], major: boolean, force: boolean, to: string|null, preview: boolean }} opts
  */
-async function run(ctx, manifest, opts) {
+async function run(root, manifest, opts) {
   const { positionals, major, force, to, preview } = opts;
   const targets = positionals.length > 0 ? positionals : Object.keys(manifest.skills).sort();
   for (const skill of targets) {
@@ -146,7 +146,7 @@ async function run(ctx, manifest, opts) {
       }
 
       // Anomaly policy: never clobber a drifted/anomalous copy without --force.
-      const { worst } = await copyStatus(ctx.cwd, skill, pin);
+      const { worst } = await copyStatus(root, skill, pin);
       if (!force && (worst === 'drifted' || worst === 'anomaly')) {
         warn(`${skill}: materialized copy has drifted or anomalous content; skipping (use --force to overwrite)`);
         continue;
@@ -189,14 +189,14 @@ async function run(ctx, manifest, opts) {
     }
 
     // Stage all targets, record the AUTHORITATIVE staged hash per output (as `add`).
-    const staged = await stageTargets(ctx.cwd, flatSpecs.map((s) => ({ target: s.target, files: s.files })));
+    const staged = await stageTargets(root, flatSpecs.map((s) => ({ target: s.target, files: s.files })));
     for (let i = 0; i < flatSpecs.length; i++) {
       const { skill, agent } = flatSpecs[i];
       newPins.get(skill).outputs[agent] = staged.targets[i].hash;
     }
     for (const [skill, pin] of newPins) manifest.skills[skill] = pin;
 
-    await commitStaged(ctx.cwd, {
+    await commitStaged(root, {
       staged,
       manifest,
       removeDirs: [],

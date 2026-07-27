@@ -7,15 +7,15 @@
 import { readManifest, pinAgents } from '../manifest.js';
 import { materializedStatus } from '../materialized-status.js';
 import { log, sanitizeMetadata } from '../util.js';
-import { resolveProject, parseArgs } from './common.js';
+import { resolveProject, resolveRoot, parseArgs } from './common.js';
 
 /**
  * @param {string[]} argv
  * @param {{ cwd: string }} ctx
  */
 export async function list(argv, ctx) {
-  parseArgs(argv);
-  const project = resolveProject(ctx.cwd);
+  const { flags } = parseArgs(argv);
+  const project = resolveProject(resolveRoot(ctx, flags));
   const manifest = await readManifest(project.manifestPath);
 
   const names = Object.keys(manifest.skills).sort();
@@ -32,7 +32,7 @@ export async function list(argv, ctx) {
     /** @type {string[]} */
     const parts = [];
     for (const agent of agents) {
-      const status = await materializedStatus(ctx.cwd, agent, skill, pin.outputs[agent]);
+      const status = await materializedStatus(project.dir, agent, skill, pin.outputs[agent]);
       parts.push(`${agent}:${status}`);
     }
     log(`  ${skill}@${pin.version}  [${parts.join(' ')}]`);

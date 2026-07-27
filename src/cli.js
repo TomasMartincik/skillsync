@@ -75,6 +75,12 @@ commands:
       (--diff for the full diff), confirm (y/N; --yes skips), fast-forward, and
       re-run hooks install. Never a blind pull.
 
+Global scope: pass --global to init/add/remove/sync/update/status/list to manage
+  HOME-scoped, always-available skills (Claude ~/.claude/skills, Codex
+  ~/.agents/skills) instead of the current project. The global manifest lives at
+  ~/.agents/skills-manifest.json and is always mode "plain". Running a bare
+  (non-global) command from your home directory is refused — pass --global.
+
 Global: this tool has zero npm dependencies and no build step.`;
 
 /**

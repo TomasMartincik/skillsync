@@ -14,7 +14,8 @@
  */
 
 import path from 'node:path';
-import { AGENTS } from '../constants.js';
+import { promises as fs } from 'node:fs';
+import { AGENTS, AGENT_TARGETS } from '../constants.js';
 import { readManifest, pinAgents } from '../manifest.js';
 import { preflight } from '../git.js';
 import { fullClone, findSkillRel } from '../fetch.js';
@@ -24,7 +25,7 @@ import { excludeEntriesFor, targetDir } from '../plan.js';
 import { refreshCacheEntry } from '../version-cache.js';
 import { assertSkillName } from '../skill-name.js';
 import { SkillsyncError, log, warn } from '../util.js';
-import { resolveProject, withLock, parseArgs } from './common.js';
+import { resolveProject, resolveRoot, withLock, parseArgs } from './common.js';
 
 /**
  * @param {string[]} argv
@@ -37,12 +38,19 @@ export async function add(argv, ctx) {
   assertNoDuplicates(positionals, 'skill');
 
   const agentsFilter = parseAgentsFilter(flags.agents);
-  const project = resolveProject(ctx.cwd);
+  const isGlobal = flags.global === true;
+  const project = resolveProject(resolveRoot(ctx, flags));
 
-  await withLock(ctx.cwd, async () => {
+  await withLock(project.dir, async () => {
     const manifest = await readManifest(project.manifestPath);
-    const { warnings } = await preflight(ctx.cwd, { mode: manifest.mode, manifestPath: project.manifestPath });
+    const { warnings } = await preflight(project.dir, { mode: manifest.mode, manifestPath: project.manifestPath });
     for (const w of warnings) log(`warning: ${w}`);
+
+    // Reverse HOME-shadow warning: adding a skill globally whose name already has an
+    // UNMANAGED copy in a home skills dir. Codex/Claude would read that stray copy
+    // alongside (or instead of) the managed one; the managed materialization will
+    // replace it. Only flag names skillsync does not already track.
+    if (isGlobal) await warnUnmanagedGlobal(project.dir, positionals, manifest);
 
     // Full clone: `add` records central's HEAD commit and the skill's current
     // published version; `sync` later reproduces exactly that pin.
@@ -79,14 +87,14 @@ export async function add(argv, ctx) {
       }
 
       // Stage all targets, then record the AUTHORITATIVE staged hash per output.
-      const staged = await stageTargets(ctx.cwd, flatSpecs.map((s) => ({ target: s.target, files: s.files })));
+      const staged = await stageTargets(project.dir, flatSpecs.map((s) => ({ target: s.target, files: s.files })));
       for (let i = 0; i < flatSpecs.length; i++) {
         const { skill, agent } = flatSpecs[i];
         newPins.get(skill).outputs[agent] = staged.targets[i].hash;
       }
       for (const [skill, pin] of newPins) manifest.skills[skill] = pin;
 
-      await commitStaged(ctx.cwd, {
+      await commitStaged(project.dir, {
         staged,
         manifest,
         removeDirs,
@@ -107,6 +115,29 @@ export async function add(argv, ctx) {
       await checkout.cleanup();
     }
   });
+}
+
+/**
+ * Warn for each named skill that is not yet managed here but whose target dir
+ * already exists on disk (a pre-existing, unmanaged copy). One warning per stray
+ * copy; skills already in the manifest are a normal re-add and never flagged.
+ * @param {string} root operating root ($HOME under --global)
+ * @param {string[]} skills
+ * @param {import('../manifest.js').Manifest} manifest
+ */
+async function warnUnmanagedGlobal(root, skills, manifest) {
+  for (const skill of skills) {
+    if (manifest.skills[skill]) continue; // already managed here — a normal update
+    for (const agent of AGENTS) {
+      const dir = path.join(root, AGENT_TARGETS[agent], skill);
+      try {
+        await fs.lstat(dir);
+        warn(`${skill}: an unmanaged copy already exists at ${dir}; adding it globally will replace that copy`);
+      } catch {
+        // absent — nothing to warn about
+      }
+    }
+  }
 }
 
 /**

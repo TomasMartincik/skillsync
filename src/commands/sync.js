@@ -28,7 +28,7 @@ import { materializedStatus } from '../materialized-status.js';
 import { PinResolver } from '../pin-resolver.js';
 import { excludeEntriesFor, targetDir } from '../plan.js';
 import { SkillsyncError, log, warn } from '../util.js';
-import { resolveProject, withLock, parseArgs } from './common.js';
+import { resolveProject, resolveRoot, withLock, parseArgs } from './common.js';
 
 /**
  * @param {string[]} argv
@@ -37,11 +37,11 @@ import { resolveProject, withLock, parseArgs } from './common.js';
 export async function sync(argv, ctx) {
   const { flags } = parseArgs(argv);
   const force = flags.force === true;
-  const project = resolveProject(ctx.cwd);
+  const project = resolveProject(resolveRoot(ctx, flags));
 
-  await withLock(ctx.cwd, async () => {
+  await withLock(project.dir, async () => {
     const manifest = await readManifest(project.manifestPath);
-    const { warnings } = await preflight(ctx.cwd, { mode: manifest.mode, manifestPath: project.manifestPath });
+    const { warnings } = await preflight(project.dir, { mode: manifest.mode, manifestPath: project.manifestPath });
     for (const w of warnings) warn(w);
 
     const names = Object.keys(manifest.skills);
@@ -56,7 +56,7 @@ export async function sync(argv, ctx) {
     for (const skill of names) {
       const pin = manifest.skills[skill];
       const statuses = await Promise.all(
-        pinAgents(pin).map((agent) => materializedStatus(ctx.cwd, agent, skill, pin.outputs[agent])),
+        pinAgents(pin).map((agent) => materializedStatus(project.dir, agent, skill, pin.outputs[agent])),
       );
       if (statuses.every((s) => s === 'ok')) continue;
       if (!force && statuses.some((s) => s === 'drifted' || s === 'anomaly')) {
@@ -94,7 +94,7 @@ export async function sync(argv, ctx) {
       }
 
       // Stage, then verify each STAGED output hash equals the recorded pin.
-      const staged = await stageTargets(ctx.cwd, flatSpecs.map((s) => ({ target: s.target, files: s.files })));
+      const staged = await stageTargets(project.dir, flatSpecs.map((s) => ({ target: s.target, files: s.files })));
       for (let i = 0; i < flatSpecs.length; i++) {
         const { skill, agent, expected } = flatSpecs[i];
         if (staged.targets[i].hash !== expected) {
@@ -105,7 +105,7 @@ export async function sync(argv, ctx) {
         }
       }
 
-      await commitStaged(ctx.cwd, {
+      await commitStaged(project.dir, {
         staged,
         manifest, // unchanged: sync does not advance pins
         removeDirs: [],
