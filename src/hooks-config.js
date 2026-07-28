@@ -24,8 +24,14 @@ import { SkillsyncError } from './util.js';
 /** Basename of the guard script; also the marker we match to find "our" entry. */
 export const GUARD_BASENAME = 'skillsync-notice.js';
 
-/** Stable name marker written into the Codex entry. */
-const CODEX_ENTRY_NAME = 'skillsync-notice';
+/**
+ * Legacy name marker on the pre-fix (invalid) flat Codex entry. No longer
+ * written; kept only so `install` can recognize and migrate that old shape.
+ */
+const CODEX_LEGACY_ENTRY_NAME = 'skillsync-notice';
+
+/** Status line Codex shows while the guard runs. */
+const CODEX_STATUS_MESSAGE = 'skillsync: checking skill updates';
 
 /**
  * @param {NodeJS.ProcessEnv} [env]
@@ -121,10 +127,27 @@ function isOurClaudeGroup(group) {
     && group.hooks.some((h) => typeof h?.command === 'string' && h.command.includes(GUARD_BASENAME));
 }
 
-/** @param {any} entry @returns {boolean} */
-function isOurCodexEntry(entry) {
+/**
+ * Structurally VALID "our" Codex entry: the documented nested shape
+ * `{ matcher, hooks: [{ type: 'command', command: '…skillsync-notice.js…' }] }`.
+ * Only this counts as present; the flat legacy shape does not.
+ * @param {any} group @returns {boolean}
+ */
+function isOurCodexEntry(group) {
+  return !!group
+    && Array.isArray(group.hooks)
+    && group.hooks.some((h) => h?.type === 'command'
+      && typeof h?.command === 'string' && h.command.includes(GUARD_BASENAME));
+}
+
+/**
+ * Legacy pre-fix Codex entry: the flat `{ name, command: [...] }` shape Codex
+ * silently rejects. Recognized only so `install` migrates it away.
+ * @param {any} entry @returns {boolean}
+ */
+function isLegacyCodexEntry(entry) {
   if (!entry) return false;
-  if (entry.name === CODEX_ENTRY_NAME) return true;
+  if (entry.name === CODEX_LEGACY_ENTRY_NAME) return true;
   return Array.isArray(entry.command)
     && entry.command.some((c) => typeof c === 'string' && c.includes(GUARD_BASENAME));
 }
@@ -161,8 +184,17 @@ export function mergeClaude(obj, guardPath) {
  */
 export function mergeCodex(obj, guardPath) {
   const arr = sessionStart(obj);
-  const kept = arr.filter((e) => !isOurCodexEntry(e));
-  kept.push({ name: CODEX_ENTRY_NAME, command: [guardPath, '--agent', 'codex'] });
+  // Remove both the valid nested shape (idempotent re-run) and the legacy flat
+  // shape (migration); unrelated matcher groups are preserved.
+  const kept = arr.filter((e) => !isOurCodexEntry(e) && !isLegacyCodexEntry(e));
+  kept.push({
+    matcher: 'startup|resume',
+    hooks: [{
+      type: 'command',
+      command: `node "${guardPath}" --agent codex`,
+      statusMessage: CODEX_STATUS_MESSAGE,
+    }],
+  });
   obj.hooks.SessionStart = kept;
   return obj;
 }
@@ -173,10 +205,16 @@ export function hasClaudeHook(obj, guardPath) {
   return Array.isArray(arr) && arr.some(isOurClaudeGroup);
 }
 
-/** @param {Record<string, any>} obj */
+/** @param {Record<string, any>} obj — true only for a structurally valid entry */
 export function hasCodexHook(obj) {
   const arr = obj?.hooks?.SessionStart;
   return Array.isArray(arr) && arr.some(isOurCodexEntry);
+}
+
+/** @param {Record<string, any>} obj — true if a legacy (invalid, pre-fix) entry is present */
+export function hasLegacyCodexHook(obj) {
+  const arr = obj?.hooks?.SessionStart;
+  return Array.isArray(arr) && arr.some(isLegacyCodexEntry);
 }
 
 // --- Public operations ----------------------------------------------------
@@ -255,6 +293,7 @@ export async function doctorHooks(opts = {}) {
 
   const claudePresent = hasClaudeHook(claudeObj, guardPath);
   const codexPresent = hasCodexHook(codexObj);
+  const codexLegacy = !codexPresent && hasLegacyCodexHook(codexObj);
 
   return [
     {
@@ -270,9 +309,12 @@ export async function doctorHooks(opts = {}) {
       present: codexPresent,
       guardExists,
       // We can read the file but never the trust state — be honest about it.
+      // Never vouch for the legacy invalid shape: it is not "present".
       note: codexPresent
         ? 'pending review — trust it once via /hooks in Codex (a changed hook re-triggers review)'
-        : null,
+        : codexLegacy
+          ? 'invalid entry (pre-fix) — run skillsync hooks install to migrate'
+          : null,
     },
   ];
 }

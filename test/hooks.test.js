@@ -14,6 +14,7 @@ import {
   mergeCodex,
   hasClaudeHook,
   hasCodexHook,
+  hasLegacyCodexHook,
   claudeSettingsPath,
   codexHooksPath,
 } from '../src/hooks-config.js';
@@ -47,15 +48,63 @@ test('mergeClaude is idempotent — twice equals once', () => {
   assert.equal(twice, once, 'a second merge does not add a duplicate entry');
 });
 
-test('mergeCodex inserts named entry, preserves unrelated, idempotent', () => {
+test('mergeCodex emits the documented nested schema (matcher / hooks / type / command string / statusMessage)', () => {
+  const obj = mergeCodex({}, GUARD);
+  const ss = obj.hooks.SessionStart;
+  assert.equal(ss.length, 1);
+  const group = ss[0];
+  assert.equal(group.matcher, 'startup|resume', 'matcher covers startup and resume');
+  assert.ok(Array.isArray(group.hooks) && group.hooks.length === 1, 'nested hooks array');
+  const hook = group.hooks[0];
+  assert.equal(hook.type, 'command');
+  assert.equal(typeof hook.command, 'string', 'command is a shell STRING, not an array');
+  assert.equal(hook.command, `node "${GUARD}" --agent codex`, 'explicit node invocation, quoted path');
+  assert.equal(hook.statusMessage, 'skillsync: checking skill updates');
+  assert.ok(hasCodexHook(obj));
+});
+
+test('mergeCodex quotes an exec path containing spaces', () => {
+  const spaced = '/Users/a b/Application Support/skillsync/bin/skillsync-notice.js';
+  const obj = mergeCodex({}, spaced);
+  const cmd = obj.hooks.SessionStart[0].hooks[0].command;
+  assert.equal(cmd, `node "${spaced}" --agent codex`);
+  assert.ok(cmd.includes(`"${spaced}"`), 'path wrapped in double quotes so spaces survive the shell');
+});
+
+test('mergeCodex migrates the legacy flat {name,command:[]} entry, preserving unrelated groups', () => {
+  const obj = {
+    hooks: {
+      SessionStart: [
+        { name: 'other', command: ['echo', 'hi'] },
+        { name: 'skillsync-notice', command: [GUARD, '--agent', 'codex'] }, // legacy invalid shape
+      ],
+    },
+  };
+  mergeCodex(obj, GUARD);
+  const ss = obj.hooks.SessionStart;
+  assert.equal(ss.length, 2, 'legacy entry replaced (not duplicated), unrelated kept');
+  assert.ok(ss.some((e) => e.name === 'other'), 'unrelated entry preserved');
+  assert.ok(!ss.some((e) => e.name === 'skillsync-notice'), 'legacy flat entry removed');
+  const ours = ss.find((e) => Array.isArray(e.hooks));
+  assert.equal(ours.matcher, 'startup|resume');
+  assert.equal(ours.hooks[0].command, `node "${GUARD}" --agent codex`);
+  assert.ok(hasCodexHook(obj));
+});
+
+test('mergeCodex is idempotent on the new shape — twice equals once', () => {
   const base = () => ({ hooks: { SessionStart: [{ name: 'other', command: ['echo', 'hi'] }] } });
-  const first = mergeCodex(base(), GUARD);
-  assert.equal(first.hooks.SessionStart.length, 2);
-  assert.equal(first.hooks.SessionStart[0].name, 'other', 'unrelated entry preserved');
-  assert.ok(hasCodexHook(first));
-  const once = JSON.stringify(first, null, 2);
-  const twice = JSON.stringify(mergeCodex(first, GUARD), null, 2);
-  assert.equal(twice, once, 'idempotent');
+  const once = JSON.stringify(mergeCodex(base(), GUARD), null, 2);
+  const twiceObj = mergeCodex(base(), GUARD);
+  const twice = JSON.stringify(mergeCodex(twiceObj, GUARD), null, 2);
+  assert.equal(twice, once, 'a second merge does not add a duplicate entry');
+});
+
+test('hasCodexHook is false for the legacy invalid shape; hasLegacyCodexHook detects it', () => {
+  const legacy = {
+    hooks: { SessionStart: [{ name: 'skillsync-notice', command: [GUARD, '--agent', 'codex'] }] },
+  };
+  assert.equal(hasCodexHook(legacy), false, 'an invalid entry must never count as present');
+  assert.equal(hasLegacyCodexHook(legacy), true);
 });
 
 test('merge handles an empty/absent config object', () => {
@@ -132,6 +181,43 @@ test('hooks doctor reports absent then present states, with the Codex review cav
     assert.match(after.stdout, /claude: entry present/);
     assert.match(after.stdout, /codex: entry present/);
     assert.match(after.stdout, /pending review/, 'codex honesty caveat present');
+  } finally {
+    await rmrf(home);
+  }
+});
+
+test('hooks doctor flags a legacy entry as invalid (not present); install migrates it to the valid shape', async () => {
+  const home = await tmpDir();
+  try {
+    const env = { HOME: home, SKILLSYNC_HOME: CLONE };
+    const codexPath = codexHooksPath(home);
+    await fs.mkdir(path.dirname(codexPath), { recursive: true });
+    // Seed the pre-fix invalid entry Codex silently rejects.
+    await fs.writeFile(
+      codexPath,
+      JSON.stringify(
+        { hooks: { SessionStart: [{ name: 'skillsync-notice', command: [GUARD, '--agent', 'codex'] }] } },
+        null,
+        2,
+      ),
+    );
+
+    const doc = await runCli(['hooks', 'doctor'], { cwd: home, env });
+    assert.equal(doc.code, 0, doc.stderr);
+    assert.match(doc.stdout, /codex: entry ABSENT/, 'the invalid legacy entry must not read as present');
+    assert.match(doc.stdout, /invalid entry \(pre-fix\)/, 'doctor names the legacy shape honestly');
+
+    await runCli(['hooks', 'install'], { cwd: home, env });
+    const parsed = JSON.parse(await fs.readFile(codexPath, 'utf8'));
+    const ss = parsed.hooks.SessionStart;
+    assert.equal(ss.length, 1, 'legacy replaced, not duplicated');
+    assert.equal(ss[0].matcher, 'startup|resume');
+    assert.equal(typeof ss[0].hooks[0].command, 'string');
+    assert.ok(!('name' in ss[0]), 'no legacy name field remains on the migrated entry');
+
+    const after = await runCli(['hooks', 'doctor'], { cwd: home, env });
+    assert.match(after.stdout, /codex: entry present/);
+    assert.match(after.stdout, /pending review/);
   } finally {
     await rmrf(home);
   }
