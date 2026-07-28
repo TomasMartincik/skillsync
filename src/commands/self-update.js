@@ -12,10 +12,15 @@
  * @module commands/self-update
  */
 
+import { execFile } from 'node:child_process';
+import path from 'node:path';
+import { promisify } from 'node:util';
 import { git, gitOrThrow } from '../git.js';
-import { installDir, installHooks } from '../hooks-config.js';
+import { installDir } from '../hooks-config.js';
 import { log, warn } from '../util.js';
 import { parseArgs, confirm } from './common.js';
+
+const execFileAsync = promisify(execFile);
 
 /**
  * @param {string[]} argv
@@ -71,10 +76,17 @@ export async function selfUpdate(argv, _ctx) {
   }
   log('updated.');
 
-  // Repair hook entries — the guard script may have changed.
-  const results = await installHooks();
-  for (const r of results) {
-    const state = r.created ? 'created' : r.changed ? 'updated' : 'already current';
-    log(`hooks ${r.agent}: ${state}`);
+  // Repair hook entries — the guard script may have changed. This MUST run in a
+  // FRESH process: ESM's module cache froze `hooks-config` at this process's
+  // import time, so an in-process call would repair with the PRE-update code and
+  // could re-write the very entry the update just fixed. Spawn the just-updated
+  // CLI instead. A repair failure is only a warning — the update itself landed.
+  try {
+    const bin = path.join(dir, 'bin', 'skillsync.js');
+    const { stdout } = await execFileAsync(process.execPath, [bin, 'hooks', 'install']);
+    if (stdout.trim()) log(stdout.trimEnd());
+  } catch (err) {
+    warn(`hook repair failed: ${err.stderr?.trim() || err.message}`);
+    warn('the update succeeded; re-run `skillsync hooks install` to repair hooks.');
   }
 }
